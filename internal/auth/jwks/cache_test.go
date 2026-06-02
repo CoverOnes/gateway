@@ -1,0 +1,187 @@
+package jwks_test
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/CoverOnes/gateway/internal/auth/jwks"
+	authjwt "github.com/CoverOnes/gateway/internal/auth/jwt"
+)
+
+// generateKey creates an Ed25519 key pair and returns the public key, kid, and base64url-encoded x.
+func generateKey(t *testing.T) (pub ed25519.PublicKey, kid, x string) {
+	t.Helper()
+
+	pubBytes, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	xVal := base64.RawURLEncoding.EncodeToString(pubBytes)
+	kidVal := "test-" + xVal[:8]
+
+	return pubBytes, kidVal, xVal
+}
+
+func serveJWKS(t *testing.T, keys []authjwt.JWKSKey) *httptest.Server {
+	t.Helper()
+
+	jwksPayload, err := json.Marshal(authjwt.JWKS{Keys: keys})
+	require.NoError(t, err)
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jwksPayload)
+	}))
+}
+
+func TestCache_FetchAndParse(t *testing.T) {
+	pub, kid, x := generateKey(t)
+
+	srv := serveJWKS(t, []authjwt.JWKSKey{
+		{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid, X: x},
+	})
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	assert.True(t, cache.Ready(), "cache should be ready after successful fetch")
+
+	got, err := cache.Get(kid)
+	require.NoError(t, err)
+	assert.Equal(t, pub, got)
+}
+
+func TestCache_FailSecure_KeepsLastGoodKeys(t *testing.T) {
+	pub, kid, x := generateKey(t)
+
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+
+		if callCount == 1 {
+			// First call: return valid JWKS.
+			jwksPayload, err := json.Marshal(authjwt.JWKS{Keys: []authjwt.JWKSKey{
+				{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid, X: x},
+			}})
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write(jwksPayload)
+		} else {
+			// Subsequent calls: simulate upstream down.
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 50*time.Millisecond, 5*time.Second)
+	cache.Start(context.Background())
+
+	// Cache is populated from first fetch.
+	assert.True(t, cache.Ready())
+
+	// Wait for background refresh to fire and fail.
+	time.Sleep(200 * time.Millisecond)
+
+	// Keys from first fetch should still be available (fail-secure).
+	assert.True(t, cache.Ready())
+
+	got, err := cache.Get(kid)
+	require.NoError(t, err)
+	assert.Equal(t, pub, got)
+}
+
+func TestCache_RefreshOnUnknownKid(t *testing.T) {
+	_, kid1, x1 := generateKey(t)
+	pub2, kid2, x2 := generateKey(t)
+
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+
+		var keys []authjwt.JWKSKey
+		if callCount == 1 {
+			// First fetch: only kid1.
+			keys = []authjwt.JWKSKey{
+				{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid1, X: x1},
+			}
+		} else {
+			// After rotation: kid1 + kid2.
+			keys = []authjwt.JWKSKey{
+				{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid1, X: x1},
+				{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid2, X: x2},
+			}
+		}
+
+		payload, err := json.Marshal(authjwt.JWKS{Keys: keys})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 10*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	// kid2 is not in cache yet — Get triggers single-flight refresh.
+	got, err := cache.Get(kid2)
+	require.NoError(t, err)
+	assert.Equal(t, pub2, got)
+	assert.GreaterOrEqual(t, callCount, 2, "should have triggered a refresh fetch")
+}
+
+func TestCache_RejectMalformedX(t *testing.T) {
+	srv := serveJWKS(t, []authjwt.JWKSKey{
+		{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: "bad-key", X: "not-valid-base64!!!"},
+	})
+	defer srv.Close()
+
+	// Serving only a malformed key should leave the cache empty (not_ready).
+	cache := jwks.NewCache(srv.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	// Cache should NOT be ready since no valid keys were loaded.
+	assert.False(t, cache.Ready(), "cache should not be ready when all keys are malformed")
+}
+
+func TestCache_InitialFetchFails_NotReady(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	assert.False(t, cache.Ready(), "cache should not be ready when initial fetch fails")
+}
+
+func TestCache_UnknownKidAfterRefreshReturnsNil(t *testing.T) {
+	_, kid1, x1 := generateKey(t)
+
+	srv := serveJWKS(t, []authjwt.JWKSKey{
+		{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid1, X: x1},
+	})
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 10*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	// Request a kid that does not exist even after refresh.
+	got, err := cache.Get("nonexistent-kid")
+	require.NoError(t, err)
+	assert.Nil(t, got, "unknown kid should return nil after re-fetch")
+}

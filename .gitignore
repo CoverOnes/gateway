@@ -1,0 +1,29 @@
+# Secrets — never commit these
+.env
+.env.local
+.env.*
+!.env.example
+local.yaml
+*.pem
+*.key
+*.p12
+*.crt
+*.pfx
+credentials*.json
+*.secret
+
+# Build artifacts
+build/
+/server
+/dist
+/tmp
+*.exe
+*.test
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp

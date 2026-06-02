@@ -1,0 +1,136 @@
+version: "2"
+
+run:
+  timeout: 5m
+  go: "1.25"
+  modules-download-mode: readonly
+  tests: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - gofumpt
+
+  settings:
+    gofumpt:
+      extra-rules: true
+      module-path: github.com/CoverOnes/gateway
+
+linters:
+  enable:
+    # Official Go tools
+    - govet
+
+    # Error handling
+    - errcheck
+    - rowserrcheck
+
+    # Static analysis
+    - staticcheck
+    - ineffassign
+    - unused
+
+    # Code quality
+    - misspell
+    - gocyclo
+    - dupl
+    - goconst
+
+    # Code style and conventions
+    - gocritic
+    - goprintffuncname
+    - lll
+    - nakedret
+    - noctx
+    - nolintlint
+    - unconvert
+    - unparam
+    - whitespace
+
+    # Security
+    - gosec
+    - bidichk
+    - copyloopvar
+    - nilerr
+    - contextcheck
+
+  settings:
+    gocyclo:
+      min-complexity: 15
+
+    dupl:
+      threshold: 150
+
+    goconst:
+      min-len: 1
+      min-occurrences: 3
+      match-constant: false
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+
+    lll:
+      line-length: 160
+
+    misspell:
+      locale: US
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+    gosec:
+      severity: low
+      confidence: low
+      excludes:
+        - G102 # Bind to all interfaces — acceptable for container deployments
+        - G103 # Unsafe block — high FP rate, review per-case via //nolint:gosec
+        - G104 # Errors not checked — duplicate of errcheck linter; nolint:errcheck used where intentional
+        - G108 # net/http timeout — timeout managed at Gin framework level
+        - G109 # Integer overflow in strconv.Atoi — not used in this project
+        - G110 # Decompression bomb — no zip decompression in this project
+        - G112 # Slowloris — handled at Gin/server framework level
+        - G113 # Deprecated http.CanonicalHeaderKey — deprecated API
+        - G114 # net/http serve without timeout — timeout set at server level
+        - G203 # HTML template unescaped — no html/template used
+        - G301 # Poor dir permissions — 0755 is standard for non-secret dirs
+        - G302 # Poor file permissions — reviewed case-by-case
+        - G303 # Temp file predictable path — reviewed case-by-case
+        - G305 # Zip traversal — no zip extraction in this project
+        - G306 # Poor file write permissions — reviewed case-by-case
+        - G307 # Poor file permissions on create — reviewed case-by-case
+        - G404 # Insecure random — crypto/rand used for all security paths
+        - G601 # Implicit memory aliasing in for loop — fixed in Go 1.22+
+        - G704 # SSRF taint analysis — healthcheck targets 127.0.0.1 only; suppressed via nolint too
+        - G115 # Integer overflow int->uint32 — suppressed via nolint on specific lines
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - mnd
+        - gocyclo
+        - dupl
+        - goconst
+        - lll
+        - noctx     # httptest.NewRequest without context is standard test pattern
+
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+
+output:
+  formats:
+    colored-line-number:
+      path: stdout
+  print-issued-lines: true
+  print-linter-name: true
+
+severity:
+  default-severity: error

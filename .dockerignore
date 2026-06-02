@@ -1,0 +1,10 @@
+.env
+.env.*
+local.yaml
+local.*.yaml
+.git
+*_test.go
+build/
+.DS_Store
+.idea/
+.vscode/
