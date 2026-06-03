@@ -2,6 +2,11 @@
 .env.*
 local.yaml
 local.*.yaml
+# Credential/key material — defense-in-depth (.gitignore already blocks these).
+*.pem
+*.key
+*.p12
+*.crt
 .git
 *_test.go
 build/
