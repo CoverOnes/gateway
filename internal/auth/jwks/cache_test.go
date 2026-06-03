@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,4 +186,95 @@ func TestCache_UnknownKidAfterRefreshReturnsNil(t *testing.T) {
 	got, err := cache.Get("nonexistent-kid")
 	require.NoError(t, err)
 	assert.Nil(t, got, "unknown kid should return nil after re-fetch")
+}
+
+// TestCache_SingleFlightReusesLeaderFetch verifies that when many goroutines
+// concurrently look up the same unknown kid, only the single-flight leader
+// performs an upstream GET; the woken waiters re-check the cache and reuse the
+// key the leader just fetched instead of issuing redundant fetches.
+func TestCache_SingleFlightReusesLeaderFetch(t *testing.T) {
+	_, kid1, x1 := generateKey(t)
+	pub2, kid2, x2 := generateKey(t)
+
+	var fetchCount int32
+
+	// release blocks the FIRST refresh fetch until all goroutines are parked on
+	// the single-flight condition, so they genuinely contend for the leader slot.
+	release := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := atomic.AddInt32(&fetchCount, 1)
+
+		var keys []authjwt.JWKSKey
+		if n == 1 {
+			// Initial fetch: only kid1 is known.
+			keys = []authjwt.JWKSKey{
+				{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid1, X: x1},
+			}
+		} else {
+			// First refresh (the leader): hold until the waiters are parked,
+			// then return kid1 + kid2.
+			if n == 2 {
+				<-release
+			}
+
+			keys = []authjwt.JWKSKey{
+				{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid1, X: x1},
+				{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid2, X: x2},
+			}
+		}
+
+		payload, err := json.Marshal(authjwt.JWKS{Keys: keys})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+
+			return
+		}
+
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 10*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	require.True(t, cache.Ready())
+	require.Equal(t, int32(1), atomic.LoadInt32(&fetchCount), "initial fetch only")
+
+	const concurrent = 12
+
+	var (
+		wg      sync.WaitGroup
+		results = make([]ed25519.PublicKey, concurrent)
+		errs    = make([]error, concurrent)
+	)
+
+	wg.Add(concurrent)
+
+	for i := range concurrent {
+		go func(idx int) {
+			defer wg.Done()
+
+			got, err := cache.Get(kid2)
+			results[idx] = got
+			errs[idx] = err
+		}(i)
+	}
+
+	// Give the goroutines time to all park on the single-flight condition behind
+	// the leader, then let the leader's fetch complete.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	// Every concurrent caller must observe the leader's freshly fetched key.
+	for i := range concurrent {
+		require.NoErrorf(t, errs[i], "goroutine %d", i)
+		assert.Equalf(t, pub2, results[i], "goroutine %d should see leader-fetched kid2", i)
+	}
+
+	// Exactly one refresh fetch (total 2: initial + single leader refresh).
+	// Without the re-check, woken waiters would each issue their own GET.
+	assert.Equal(t, int32(2), atomic.LoadInt32(&fetchCount),
+		"single-flight must collapse concurrent unknown-kid lookups into one upstream fetch")
 }

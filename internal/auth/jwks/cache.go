@@ -71,8 +71,17 @@ func (c *Cache) Get(kid string) (ed25519.PublicKey, error) {
 		return pub, nil
 	}
 
-	// Cache miss: try single-flight refresh.
-	if err := c.singleFlightFetch(); err != nil {
+	// Cache miss: try single-flight refresh. The hasKid callback lets a woken
+	// waiter reuse a key that the leader just fetched, skipping a redundant GET.
+	hasKid := func() bool {
+		c.mu.RLock()
+		_, found := c.keys[kid]
+		c.mu.RUnlock()
+
+		return found
+	}
+
+	if err := c.singleFlightFetch(hasKid); err != nil {
 		slog.Warn("JWKS refresh on unknown kid failed", "kid", kid, "err", err)
 		// Keep last-good keys; return nil for this kid (will become 401 UNAUTHORIZED).
 	}
@@ -100,17 +109,34 @@ func (c *Cache) Ready() bool {
 // singleFlightFetch prevents stampedes of concurrent refreshes on unknown-kid.
 // Only one goroutine performs the fetch at a time; others block on a sync.Cond
 // (no spin-wait) until the in-flight fetch completes.
-func (c *Cache) singleFlightFetch() error {
+//
+// satisfied is an optional cache re-check: when a waiter is woken after the
+// leader's fetch completes, it calls satisfied() and — if the leader already
+// populated the key it needed — returns immediately WITHOUT issuing its own
+// fetch. This guarantees that N concurrent unknown-kid lookups collapse into a
+// single upstream GET (the leader's), instead of N back-to-back fetches.
+// A nil satisfied callback always fetches (used by callers that just want a
+// fresh refresh regardless of any specific kid).
+func (c *Cache) singleFlightFetch(satisfied func() bool) error {
 	c.inflightMu.Lock()
 
-	// Wait until no fetch is in flight.
+	// woken is true once we have slept on the condition at least once, meaning
+	// some other goroutine's fetch completed between our entry and our wake.
+	woken := false
 	for c.inflight {
 		c.inflightCond.Wait() // releases inflightMu; re-acquires on wake
+		woken = true
 	}
 
-	// We now hold inflightMu and inflight == false.
-	// Check whether another waiter already completed a successful fetch
-	// (re-check the actual cache under the read lock below after setting inflight).
+	// We were woken by the leader's Broadcast and a previous fetch already ran.
+	// If that fetch satisfied our need, reuse it and skip our own GET.
+	if woken && satisfied != nil && satisfied() {
+		c.inflightMu.Unlock()
+
+		return nil
+	}
+
+	// We now hold inflightMu and inflight == false; become the leader.
 	c.inflight = true
 	c.inflightMu.Unlock()
 

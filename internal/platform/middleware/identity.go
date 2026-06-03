@@ -8,6 +8,19 @@ import (
 
 // identityHeaders lists all client-supplied identity headers that MUST be stripped
 // before forwarding to upstream services to prevent spoofing attacks.
+//
+// Implicit contract — strip-list vs inject-list are deliberately asymmetric:
+//   - ALL headers below are STRIPPED on every request (StripIdentityHeaders +
+//     InjectIdentity Step 1), so a client can never spoof any of them.
+//   - Only X-User-Id, X-Kyc-Tier, and X-Account-Type are RE-INJECTED from the
+//     verified JWT claims (InjectIdentity Step 2). Upstreams may trust these.
+//   - X-User-Email and X-User-Role are intentionally NOT injected: the gateway
+//     does not vouch for them. They appear here only to be stripped — upstreams
+//     must NEVER treat an inbound X-User-Email / X-User-Role as authoritative,
+//     because the gateway guarantees only their absence, not their value.
+//
+// If a future claim (e.g. email/role) becomes gateway-vouched, it MUST be added
+// to InjectIdentity Step 2 below as well — adding it here alone only strips it.
 var identityHeaders = []string{
 	"X-User-Id",
 	"X-Kyc-Tier",
