@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -34,7 +35,7 @@ func TestCORS(t *testing.T) {
 			r.Use(CORS(tc.origins))
 			r.Any("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-			req := httptest.NewRequest(tc.method, "/x", nil)
+			req := httptest.NewRequestWithContext(context.Background(), tc.method, "/x", http.NoBody)
 			if tc.reqOrigin != "" {
 				req.Header.Set("Origin", tc.reqOrigin)
 			}
