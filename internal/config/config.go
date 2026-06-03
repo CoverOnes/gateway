@@ -30,6 +30,10 @@ type Config struct {
 	UserUpstreamURL string `mapstructure:"user_upstream_url"` // USER_UPSTREAM_URL
 	Upstreams       string `mapstructure:"upstreams"`         // GATEWAY_UPSTREAMS (comma-separated svc=url)
 
+	// CORS — comma-separated allowed origins (e.g. "http://localhost:5500").
+	// Empty string disables CORS headers (production: CDN handles it).
+	CORSOrigins string `mapstructure:"cors_origins"` // GATEWAY_CORS_ORIGINS
+
 	// Rate limiting
 	RateLimitPerMin     int `mapstructure:"rate_limit_per_min"`      // GATEWAY_RATE_LIMIT_PER_MIN
 	AuthRateLimitPerMin int `mapstructure:"auth_rate_limit_per_min"` // GATEWAY_AUTH_RATE_LIMIT_PER_MIN
@@ -59,6 +63,7 @@ func Load() (*Config, error) {
 		"jwt_audience":            "GATEWAY_JWT_AUDIENCE",
 		"jwt_leeway_sec":          "GATEWAY_JWT_LEEWAY_SEC",
 		"upstreams":               "GATEWAY_UPSTREAMS",
+		"cors_origins":            "GATEWAY_CORS_ORIGINS",
 		"rate_limit_per_min":      "GATEWAY_RATE_LIMIT_PER_MIN",
 		"auth_rate_limit_per_min": "GATEWAY_AUTH_RATE_LIMIT_PER_MIN",
 		"proxy_timeout_sec":       "GATEWAY_PROXY_TIMEOUT_SEC",
