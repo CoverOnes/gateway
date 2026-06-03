@@ -162,9 +162,19 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 	var corsOrigins []string
 	if appCfg.CORSOrigins != "" {
 		for _, o := range strings.Split(appCfg.CORSOrigins, ",") {
-			if s := strings.TrimSpace(o); s != "" {
-				corsOrigins = append(corsOrigins, s)
+			s := strings.TrimSpace(o)
+			if s == "" {
+				continue
 			}
+			// Reject wildcard / null: combining "*"/"null" with credentials is CWE-942.
+			if s == "*" || strings.EqualFold(s, "null") {
+				slog.Warn("cors: ignoring unsafe origin entry (wildcard/null not allowed with credentials)", "entry", s)
+				continue
+			}
+			corsOrigins = append(corsOrigins, s)
+		}
+		if len(corsOrigins) > 0 {
+			slog.Info("cors: allowlist configured", "origins", corsOrigins)
 		}
 	}
 

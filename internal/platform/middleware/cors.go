@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -12,6 +13,12 @@ import (
 func CORS(allowedOrigins []string) gin.HandlerFunc {
 	allowed := make(map[string]struct{}, len(allowedOrigins))
 	for _, o := range allowedOrigins {
+		// Defense-in-depth: never honor wildcard or null origins — combining "*"/"null"
+		// with Access-Control-Allow-Credentials:true is a CWE-942 vulnerability. "null" is
+		// browser-sent from sandboxed iframes / file:// contexts.
+		if o == "" || o == "*" || strings.EqualFold(o, "null") {
+			continue
+		}
 		allowed[o] = struct{}{}
 	}
 
@@ -31,7 +38,7 @@ func CORS(allowedOrigins []string) gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
-		c.Header("Access-Control-Max-Age", "86400")
+		c.Header("Access-Control-Max-Age", "3600")
 		c.Header("Vary", "Origin")
 
 		// Handle preflight OPTIONS immediately — no further processing needed.
