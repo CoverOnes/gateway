@@ -3,6 +3,7 @@ package handler
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/CoverOnes/gateway/internal/auth/jwks"
@@ -20,8 +21,9 @@ type RouterConfig struct {
 	JWKSCache           *jwks.Cache
 	RouteTable          config.RouteTable
 	ProxyTimeout        int
-	RateLimitPerMin     int // GATEWAY_RATE_LIMIT_PER_MIN; 0 → default 60
-	AuthRateLimitPerMin int // GATEWAY_AUTH_RATE_LIMIT_PER_MIN; 0 → default 20
+	RateLimitPerMin     int      // GATEWAY_RATE_LIMIT_PER_MIN; 0 → default 60
+	AuthRateLimitPerMin int      // GATEWAY_AUTH_RATE_LIMIT_PER_MIN; 0 → default 20
+	CORSOrigins         []string // GATEWAY_CORS_ORIGINS; nil/empty disables CORS headers
 }
 
 // rateLimitOrDefault returns v if > 0, otherwise fallback.
@@ -46,6 +48,12 @@ func NewRouter(cfg RouterConfig) (*gin.Engine, error) {
 
 	r := gin.New()
 	r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+
+	// CORS must be first — preflight OPTIONS must be handled before any other middleware
+	// (rate limiter, auth, etc.) can reject the request.
+	if len(cfg.CORSOrigins) > 0 {
+		r.Use(middleware.CORS(cfg.CORSOrigins))
+	}
 
 	// Global middleware chain.
 	r.Use(middleware.Recover())
@@ -151,6 +159,25 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 
 	verifier := jwt.NewVerifier(cache, appCfg.JWTIssuer, appCfg.JWTAudience, appCfg.JWTLeewaySec)
 
+	var corsOrigins []string
+	if appCfg.CORSOrigins != "" {
+		for _, o := range strings.Split(appCfg.CORSOrigins, ",") {
+			s := strings.TrimSpace(o)
+			if s == "" {
+				continue
+			}
+			// Reject wildcard / null: combining "*"/"null" with credentials is CWE-942.
+			if s == "*" || strings.EqualFold(s, "null") {
+				slog.Warn("cors: ignoring unsafe origin entry (wildcard/null not allowed with credentials)", "entry", s)
+				continue
+			}
+			corsOrigins = append(corsOrigins, s)
+		}
+		if len(corsOrigins) > 0 {
+			slog.Info("cors: allowlist configured", "origins", corsOrigins)
+		}
+	}
+
 	r, err := NewRouter(RouterConfig{
 		Verifier:            verifier,
 		JWKSCache:           cache,
@@ -158,6 +185,7 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		ProxyTimeout:        appCfg.ProxyTimeoutSec,
 		RateLimitPerMin:     appCfg.RateLimitPerMin,
 		AuthRateLimitPerMin: appCfg.AuthRateLimitPerMin,
+		CORSOrigins:         corsOrigins,
 	})
 	if err != nil {
 		return nil, err
