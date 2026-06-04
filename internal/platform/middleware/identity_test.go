@@ -258,6 +258,91 @@ func TestInjectIdentity_LegacyTokenWithoutEmailVerifiedDefaultsFalse(t *testing.
 		"older token without email_verified claim must fail safe to X-Email-Verified: false")
 }
 
+// TestInjectIdentity_NonCanonicalCaseSpoofIsStripped proves the strip is
+// canonicalization-safe, not exact-case-only. An attacker who sets an identity
+// header via the RAW header map (bypassing http.Header.Set's canonicalization)
+// in lowercase or mixed-case must STILL have it overridden by the verified JWT
+// claim. This documents the invariant against a future refactor that might read
+// or write the raw map directly.
+//
+// The token is UNVERIFIED (email_verified=false), so a successful strip yields
+// X-Email-Verified: false from the claim — never the spoofed "true".
+func TestInjectIdentity_NonCanonicalCaseSpoofIsStripped(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		rawHeader string // non-canonical key written straight into the raw map
+	}{
+		{name: "all lowercase", rawHeader: "x-email-verified"},
+		{name: "mixed case", rawHeader: "X-Email-VERIFIED"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			pub, priv, err := ed25519.GenerateKey(rand.Reader)
+			require.NoError(t, err)
+
+			kid := "noncanonical-spoof-test-kid"
+			r, captured := setupIdentityTestRouter(t, pub, kid)
+
+			// UNVERIFIED user — a correct strip must yield "false".
+			tokenStr := generateTokenWithEmailVerified(t, priv, kid, "user-nc", 1, false)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+			// Write directly into the raw map so the key is NOT canonicalized.
+			// http.Header.Set would rewrite this to "X-Email-Verified"; we bypass it
+			// to simulate an attacker (or a buggy proxy) emitting a non-canonical key.
+			req.Header[tc.rawHeader] = []string{"true"} // spoofed verified header
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code)
+
+			// Canonical lookup must see only the claim-derived "false".
+			assert.Equal(t, "false", captured.headers.Get("X-Email-Verified"),
+				"non-canonical-case spoof must be stripped; X-Email-Verified must come from the unverified JWT claim")
+			// And no stray non-canonical key may survive to the upstream.
+			assert.NotContains(t, captured.headers.Values("X-Email-Verified"), "true",
+				"spoofed verified value must never reach upstream under any header casing")
+		})
+	}
+}
+
+// TestInjectIdentity_NonCanonicalCaseUserIdSpoofIsStripped is the X-User-Id
+// counterpart of the email-verified casing test: a non-canonical raw-map spoof
+// of the user id must still be replaced by the JWT subject.
+func TestInjectIdentity_NonCanonicalCaseUserIdSpoofIsStripped(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "noncanonical-userid-test-kid"
+	r, captured := setupIdentityTestRouter(t, pub, kid)
+
+	tokenStr := generateToken(t, priv, kid, "real-user-sub", 1)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	// Non-canonical raw-map spoof of X-User-Id.
+	req.Header["x-user-id"] = []string{"victim-user-id"}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	assert.Equal(t, "real-user-sub", captured.headers.Get("X-User-Id"),
+		"X-User-Id must come from JWT claims even when the spoof uses a non-canonical header key")
+	assert.NotContains(t, captured.headers.Values("X-User-Id"), "victim-user-id",
+		"non-canonical-case spoofed X-User-Id must never reach upstream")
+}
+
 func TestStripIdentityHeaders_PublicRouteDropsClientIdentity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
