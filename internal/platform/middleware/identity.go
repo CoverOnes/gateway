@@ -76,6 +76,12 @@ func InjectIdentity() gin.HandlerFunc {
 		// Fail-safe: an older token without the email_verified claim leaves
 		// claims.EmailVerified at its zero value (false), so this injects
 		// "false" — never an empty or "true" header for an unverified user.
+		//
+		// Cross-service string contract (TIGHT): the gateway emits the literal
+		// "true"/"false" via strconv.FormatBool, and the kyc service gates on an
+		// exact "true" match (kyc internal/platform/middleware/identity.go).
+		// Neither side may drift to a different encoding (JSON bool / "1" / "True")
+		// without breaking the email-verified gate.
 		c.Request.Header.Set("X-Email-Verified", strconv.FormatBool(claims.EmailVerified))
 
 		c.Next()
