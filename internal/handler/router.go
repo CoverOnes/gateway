@@ -102,6 +102,13 @@ func NewRouter(cfg RouterConfig) (*gin.Engine, error) {
 	authGroup.POST("/refresh", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
+	// Email verification — public (the user is not logged in yet), NoCache + authRL.
+	authGroup.POST("/verify-email", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+	authGroup.POST("/resend-verification", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
 
 	// Logout requires a valid access token — protected.
 	authMW := middleware.Auth(cfg.Verifier)
