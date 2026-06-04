@@ -8,6 +8,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// loopbackUpstream is a reusable upstream value pointing to 127.0.0.1 used across
+// loopback-blocking tests. Defined as a constant to satisfy goconst.
+const loopbackUpstream = "local=http://127.0.0.1:8080"
+
 func baseConfig() *config.Config {
 	return &config.Config{
 		Port:                8080,
@@ -190,7 +194,7 @@ func TestParseRouteTable_AllowHostname(t *testing.T) {
 func TestParseRouteTable_RejectLoopbackInProduction(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Env = "production"
-	cfg.Upstreams = "local=http://127.0.0.1:8080"
+	cfg.Upstreams = loopbackUpstream
 
 	_, err := config.ParseRouteTable(cfg)
 	require.Error(t, err)
@@ -200,9 +204,23 @@ func TestParseRouteTable_RejectLoopbackInProduction(t *testing.T) {
 func TestParseRouteTable_AllowLoopbackInDevelopment(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Env = "development"
-	cfg.Upstreams = "local=http://127.0.0.1:8080"
+	cfg.Upstreams = loopbackUpstream
 
 	table, err := config.ParseRouteTable(cfg)
 	require.NoError(t, err, "loopback must be allowed in development for local integration tests")
 	assert.Contains(t, table, "local")
+}
+
+// TestParseRouteTable_RejectLoopbackInStaging asserts staging gets prod-grade loopback
+// blocking: !IsDev() is the single source of truth, so staging and production are
+// treated identically for upstream-URL validation. Previously isProd = EqualFold("production")
+// let staging use loopback addresses inconsistently with the HMAC and other non-dev gates.
+func TestParseRouteTable_RejectLoopbackInStaging(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Env = "staging"
+	cfg.Upstreams = loopbackUpstream
+
+	_, err := config.ParseRouteTable(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "loopback", "loopback must be rejected in staging (non-dev)")
 }

@@ -21,10 +21,14 @@ type RouteTable map[string]UpstreamEntry
 // services from the comma-separated GATEWAY_UPSTREAMS value.
 func ParseRouteTable(cfg *Config) (RouteTable, error) {
 	table := make(RouteTable)
-	isProd := strings.EqualFold(cfg.Env, "production")
+	// Use !IsDev() as the single source of truth for prod-grade restrictions.
+	// This ensures staging and production are treated identically: loopback upstream
+	// addresses are blocked in both. Previously isProd = EqualFold("production") let
+	// staging use loopback addresses, inconsistent with the HMAC and other non-dev gates.
+	isNonDev := !cfg.IsDev()
 
 	// The "user" service is always required.
-	if err := addEntryWithEnv(table, "user", cfg.UserUpstreamURL, isProd); err != nil {
+	if err := addEntryWithEnv(table, "user", cfg.UserUpstreamURL, isNonDev); err != nil {
 		return nil, fmt.Errorf("user upstream: %w", err)
 	}
 
@@ -49,7 +53,7 @@ func ParseRouteTable(cfg *Config) (RouteTable, error) {
 				return nil, fmt.Errorf("upstream entry has empty service name: %q", pair)
 			}
 
-			if err := addEntryWithEnv(table, svc, rawURL, isProd); err != nil {
+			if err := addEntryWithEnv(table, svc, rawURL, isNonDev); err != nil {
 				return nil, fmt.Errorf("upstream %q: %w", svc, err)
 			}
 		}

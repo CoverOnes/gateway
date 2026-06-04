@@ -113,13 +113,19 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 		// without breaking the email-verified gate.
 		c.Request.Header.Set("X-Email-Verified", strconv.FormatBool(claims.EmailVerified))
 
-		// Pin the canonical X-Request-ID onto the REQUEST header so the value the
-		// gateway signs over is exactly the value the proxy forwards downstream
-		// (proxy.go reads req.In.Header.Get("X-Request-ID")). RequestID() middleware
-		// only writes the id to context + the response header, so without this an
-		// inbound request with no/invalid X-Request-ID would forward an EMPTY value
-		// downstream while we signed over the generated one — a guaranteed mismatch.
-		// Pinning it here also fixes that latent propagation gap.
+		// Pin the gateway-validated X-Request-ID onto the REQUEST header so the value
+		// signed over is exactly the value the proxy forwards downstream (proxy.go reads
+		// req.In.Header.Get("X-Request-ID")). RequestID() only writes the id to context
+		// + the response header, so without this pinning an inbound request with a
+		// missing/invalid client value would forward an EMPTY value while we signed over
+		// the gateway-generated one — a guaranteed downstream mismatch.
+		//
+		// NOTE on trust scope: X-Request-ID is client-proposable within a safe pattern
+		// (^[A-Za-z0-9_-]{1,64}$); invalid/empty values are replaced by a gateway-
+		// generated UUID. It is a CORRELATION field, NOT an authorization input.
+		// Downstream MUST NOT make authorization decisions based on X-Request-ID; its
+		// presence in the canonical string exists only to bind the signature to a single
+		// hop and prevent trivial replay — see CONVENTIONS §24.1.
 		rid := c.GetString("request_id")
 		c.Request.Header.Set("X-Request-ID", rid)
 
