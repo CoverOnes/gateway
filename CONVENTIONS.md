@@ -127,11 +127,19 @@ TLS 1.3 terminated at edge (Railway / ingress) — services themselves listen pl
 ## 9. Middleware Chain Order
 
 ```
-recover -> request-id -> security-headers -> slog access-log -> CORS -> rate-limit -> auth (per-route)
+recover -> request-id -> security-headers -> strip-identity-headers -> slog access-log
+  -> CORS -> global-IP-rate-limit -> public groups
+  -> protected groups: Auth -> PerUserRateLimit(claims.Subject, 300/min) -> InjectIdentity -> forward
 ```
 
 - Deny-by-default: routes without explicit auth + min-tier declaration are NOT registered.
-- Rate limiting via Redis; nil Redis = pass-through in dev.
+- Global IP rate limit (`ipRL`) guards all routes before any auth decision.
+- Per-user rate limit (`userRL`) is keyed on JWT subject (user UUID); placed AFTER Auth so
+  the key is always the verified identity, never a client-supplied value. Placed BEFORE
+  InjectIdentity so a rate-limited request is rejected before downstream services are involved.
+- In-process limiter (in-memory LRU): per-pod bucket. Effective cross-pod limit = N×300/min
+  for N replicas — acceptable for current single-pod deploy; add Redis sliding-window for
+  strict multi-pod enforcement.
 
 ---
 

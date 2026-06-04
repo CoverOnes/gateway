@@ -23,6 +23,7 @@ type RouterConfig struct {
 	ProxyTimeout        int
 	RateLimitPerMin     int      // GATEWAY_RATE_LIMIT_PER_MIN; 0 → default 60
 	AuthRateLimitPerMin int      // GATEWAY_AUTH_RATE_LIMIT_PER_MIN; 0 → default 20
+	UserRateLimitPerMin int      // GATEWAY_USER_RATE_LIMIT_PER_MIN; 0 → default 300
 	CORSOrigins         []string // GATEWAY_CORS_ORIGINS; nil/empty disables CORS headers
 	// HMACSecret signs the gateway-origin identity tuple (CONVENTIONS §24).
 	// Empty → signing disabled (development only; non-dev config fails fast).
@@ -42,7 +43,8 @@ func rateLimitOrDefault(v, fallback int) int {
 // Route chain order per CONVENTIONS.md §9:
 // Recover -> RequestID -> SecurityHeaders -> StripIdentityHeaders -> accessLogger
 // -> [health+jwks pre-ratelimit]
-// -> RateLimit -> public passthrough groups -> protected proxy groups (Auth -> InjectIdentity -> Forward)
+// -> GlobalIPRateLimit -> public passthrough groups
+// -> protected proxy groups (Auth -> PerUserRateLimit(claims.Subject, 300/min) -> InjectIdentity -> Forward)
 //
 // Returns an error if the proxy registry cannot be built (invalid route table).
 // Callers should handle the error and fail fast at boot rather than panic.
@@ -117,19 +119,27 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 
 	// Logout requires a valid access token — protected.
 	authMW := middleware.Auth(cfg.Verifier)
+	// Per-user rate limiter: keyed on JWT subject (user UUID).
+	// Placed AFTER Auth (which validates the JWT and injects claims) so the key is always
+	// the authenticated user identity, never an attacker-supplied value.
+	// Placed BEFORE InjectIdentity so a rate-limited request is rejected before downstream
+	// services are involved at all.
+	userRL := middleware.NewUserRateLimiter(rateLimitOrDefault(cfg.UserRateLimitPerMin, 300))
 	authGroup.POST(
 		"/logout",
 		authMW,
+		userRL.Handler(),
 		middleware.InjectIdentity(cfg.HMACSecret),
 		func(c *gin.Context) {
 			registry.Forward(c, "user")
 		},
 	)
 
-	// Protected proxy routes — Auth + InjectIdentity required.
+	// Protected proxy routes — Auth + PerUserRateLimit + InjectIdentity required.
 	// /api/:svc/* pattern with allowlist-only forwarding.
 	api := r.Group("/api/:svc")
 	api.Use(authMW)
+	api.Use(userRL.Handler())
 	api.Use(middleware.InjectIdentity(cfg.HMACSecret))
 	api.Any("/*proxyPath", proxyH.Forward)
 
@@ -197,6 +207,7 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		ProxyTimeout:        appCfg.ProxyTimeoutSec,
 		RateLimitPerMin:     appCfg.RateLimitPerMin,
 		AuthRateLimitPerMin: appCfg.AuthRateLimitPerMin,
+		UserRateLimitPerMin: appCfg.UserRateLimitPerMin,
 		CORSOrigins:         corsOrigins,
 		HMACSecret:          []byte(appCfg.HMACSecret),
 	})
