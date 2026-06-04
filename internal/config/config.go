@@ -9,6 +9,10 @@ import (
 	"github.com/spf13/viper"
 )
 
+// minHMACSecretLen is the minimum length (in bytes/chars) required for the
+// gateway-origin HMAC secret in non-dev environments (CONVENTIONS §24).
+const minHMACSecretLen = 32
+
 // Config holds all configuration for the gateway service.
 type Config struct {
 	// Server
@@ -25,6 +29,15 @@ type Config struct {
 	JWTIssuer        string `mapstructure:"jwt_issuer"`             // GATEWAY_JWT_ISSUER
 	JWTAudience      string `mapstructure:"jwt_audience"`           // GATEWAY_JWT_AUDIENCE
 	JWTLeewaySec     int    `mapstructure:"jwt_leeway_sec"`         // GATEWAY_JWT_LEEWAY_SEC
+
+	// Gateway-origin HMAC signing (CONVENTIONS §24).
+	// Shared secret used to HMAC-SHA256 sign the injected identity tuple so downstream
+	// services can prove the headers originated from the gateway (defense-in-depth,
+	// layered on the gateway-sole-JWT-verifier model — NOT a replacement). Each
+	// downstream service is configured with the SAME value via <SVC>_GATEWAY_HMAC_SECRET.
+	// Production/non-dev: required, MUST be >= minHMACSecretLen chars (fail-fast).
+	// Development: empty is allowed and disables signing (parity with empty CORS).
+	HMACSecret string `mapstructure:"hmac_secret"` // GATEWAY_HMAC_SECRET
 
 	// Upstream services
 	UserUpstreamURL string `mapstructure:"user_upstream_url"` // USER_UPSTREAM_URL
@@ -53,6 +66,8 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	// Explicit BindEnv for every key to guarantee resolution regardless of prefix.
+	// #nosec G101 -- these are config-key→ENV-VAR-NAME mappings, not credential
+	// values; "GATEWAY_HMAC_SECRET" is the name of the env var to read, never a secret.
 	bindings := map[string]string{
 		"port":                    "GATEWAY_PORT",
 		"env":                     "GATEWAY_ENV",
@@ -62,6 +77,7 @@ func Load() (*Config, error) {
 		"jwt_issuer":              "GATEWAY_JWT_ISSUER",
 		"jwt_audience":            "GATEWAY_JWT_AUDIENCE",
 		"jwt_leeway_sec":          "GATEWAY_JWT_LEEWAY_SEC",
+		"hmac_secret":             "GATEWAY_HMAC_SECRET",
 		"upstreams":               "GATEWAY_UPSTREAMS",
 		"cors_origins":            "GATEWAY_CORS_ORIGINS",
 		"rate_limit_per_min":      "GATEWAY_RATE_LIMIT_PER_MIN",
@@ -141,6 +157,19 @@ func (c *Config) validate() error {
 	validLogLevels := map[string]bool{"DEBUG": true, "INFO": true, "WARN": true, "ERROR": true}
 	if !validLogLevels[strings.ToUpper(c.LogLevel)] {
 		errs = append(errs, "GATEWAY_LOG_LEVEL must be DEBUG|INFO|WARN|ERROR")
+	}
+
+	// Gateway-origin HMAC secret (CONVENTIONS §24). Production/non-dev MUST set a
+	// secret of at least minHMACSecretLen chars so downstream can verify header
+	// authenticity. Development may leave it empty (signing is then disabled, the
+	// same dev-friendly posture as an empty CORS allowlist).
+	if !c.IsDev() {
+		switch {
+		case c.HMACSecret == "":
+			errs = append(errs, "GATEWAY_HMAC_SECRET is required in non-development environments")
+		case len(c.HMACSecret) < minHMACSecretLen:
+			errs = append(errs, fmt.Sprintf("GATEWAY_HMAC_SECRET must be at least %d characters", minHMACSecretLen))
+		}
 	}
 
 	if len(errs) > 0 {

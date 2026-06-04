@@ -2,9 +2,14 @@ package middleware_test
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +21,10 @@ import (
 	"github.com/CoverOnes/gateway/internal/platform/middleware"
 	"github.com/gin-gonic/gin"
 )
+
+// testHMACSecret is a fixed >=32-char secret used to assert the gateway-origin
+// signature is computed deterministically. Test-only; not a real credential.
+const testHMACSecret = "test-gateway-hmac-secret-0123456789ABCDEF"
 
 // capturedRequest records the headers as seen by the upstream handler.
 type capturedRequest struct {
@@ -34,6 +43,18 @@ func (r *testKeyResolver) Get(kid string) (ed25519.PublicKey, error) {
 func setupIdentityTestRouter(t *testing.T, pub ed25519.PublicKey, kid string) (*gin.Engine, *capturedRequest) {
 	t.Helper()
 
+	return setupIdentityTestRouterWithSecret(t, pub, kid, nil)
+}
+
+// setupIdentityTestRouterWithSecret mirrors setupIdentityTestRouter but lets a test
+// configure the gateway-origin HMAC secret. A nil/empty secret disables signing
+// (development parity). RequestID() is registered so X-Request-ID is available to
+// InjectIdentity for the canonical signing string (CONVENTIONS §24).
+func setupIdentityTestRouterWithSecret(
+	t *testing.T, pub ed25519.PublicKey, kid string, hmacSecret []byte,
+) (*gin.Engine, *capturedRequest) {
+	t.Helper()
+
 	gin.SetMode(gin.TestMode)
 
 	resolver := &testKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
@@ -42,15 +63,28 @@ func setupIdentityTestRouter(t *testing.T, pub ed25519.PublicKey, kid string) (*
 	captured := &capturedRequest{}
 
 	r := gin.New()
+	r.Use(middleware.RequestID())
 	protected := r.Group("/protected")
 	protected.Use(middleware.Auth(verifier))
-	protected.Use(middleware.InjectIdentity())
+	protected.Use(middleware.InjectIdentity(hmacSecret))
 	protected.GET("/resource", func(c *gin.Context) {
 		captured.headers = c.Request.Header.Clone()
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
 	return r, captured
+}
+
+// expectedSignature recomputes the gateway-origin HMAC the way a downstream
+// service MUST (CONVENTIONS §24): hex(HMAC-SHA256(secret, canonicalString)) where
+// canonicalString = the literal header values joined by "|" in the locked order
+// X-User-Id|X-Kyc-Tier|X-Account-Type|X-Email-Verified|X-Request-ID|X-Gateway-Ts.
+func expectedSignature(secret []byte, userID, kycTier, accountType, emailVerified, requestID, ts string) string {
+	canonical := strings.Join([]string{userID, kycTier, accountType, emailVerified, requestID, ts}, "|")
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(canonical))
+
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func generateToken(t *testing.T, priv ed25519.PrivateKey, kid, sub string, kycTier int16) string {
@@ -402,4 +436,207 @@ func TestInjectIdentity_UnauthenticatedPathHasNoIdentityHeaders(t *testing.T) {
 	// StripIdentityHeaders is global; the client-supplied header must be gone.
 	assert.Empty(t, captured.headers.Get("X-User-Id"),
 		"identity header must be stripped by StripIdentityHeaders before reaching public handler")
+}
+
+// TestInjectIdentity_GatewaySignatureMatchesExpectedHMAC asserts that, for a known
+// secret and known injected header values, X-Gateway-Signature equals the HMAC the
+// downstream verifier recomputes over the locked canonical string, and X-Gateway-Ts
+// is present. It also proves the signature is computed over the SAME values the
+// downstream reads (the injected JWT-derived values, not any client-supplied ones).
+func TestInjectIdentity_GatewaySignatureMatchesExpectedHMAC(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "sig-test-kid"
+	secret := []byte(testHMACSecret)
+	tests := []struct {
+		name          string
+		kycTier       int16
+		emailVerified bool
+		wantTier      string
+		wantEmailVerf string
+	}{
+		{name: "verified tier2", kycTier: 2, emailVerified: true, wantTier: "2", wantEmailVerf: "true"},
+		{name: "unverified tier0", kycTier: 0, emailVerified: false, wantTier: "0", wantEmailVerf: "false"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, captured := setupIdentityTestRouterWithSecret(t, pub, kid, secret)
+			tokenStr := generateTokenWithEmailVerified(t, priv, kid, "sig-user-sub", tc.kycTier, tc.emailVerified)
+
+			const fixedRequestID = "req-sig-fixed-0001"
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+			req.Header.Set("X-Request-ID", fixedRequestID) // deterministic canonical input
+			req.Header.Set("X-Kyc-Tier", "9")              // forged — must NOT influence the signature
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code)
+
+			ts := captured.headers.Get("X-Gateway-Ts")
+			require.NotEmpty(t, ts, "X-Gateway-Ts must be set on the signed protected path")
+			tsInt, err := strconv.ParseInt(ts, 10, 64)
+			require.NoError(t, err, "X-Gateway-Ts must be unix seconds")
+			assert.InDelta(t, time.Now().Unix(), tsInt, 5, "X-Gateway-Ts must be ~now")
+
+			// The signature MUST be computed over the injected (JWT-derived) values:
+			// the real tier from the token, NOT the forged "9".
+			want := expectedSignature(secret, "sig-user-sub", tc.wantTier, "PERSONAL", tc.wantEmailVerf, fixedRequestID, ts)
+			assert.Equal(t, want, captured.headers.Get("X-Gateway-Signature"),
+				"X-Gateway-Signature must equal HMAC over the locked canonical string of the injected values")
+			// Sanity: a signature over the forged tier must NOT match — proves we signed real values.
+			forged := expectedSignature(secret, "sig-user-sub", "9", "PERSONAL", tc.wantEmailVerf, fixedRequestID, ts)
+			assert.NotEqual(t, forged, captured.headers.Get("X-Gateway-Signature"),
+				"signature must not validate against forged client-supplied values")
+		})
+	}
+}
+
+// TestInjectIdentity_NoSecretDisablesSigning asserts the development parity path:
+// with no configured secret, identity headers are still injected but NO gateway-origin
+// signature headers are emitted.
+func TestInjectIdentity_NoSecretDisablesSigning(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "no-secret-kid"
+	r, captured := setupIdentityTestRouterWithSecret(t, pub, kid, nil) // signing disabled
+
+	tokenStr := generateToken(t, priv, kid, "nosig-user", 1)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "nosig-user", captured.headers.Get("X-User-Id"),
+		"identity headers must still be injected when signing is disabled")
+	assert.Empty(t, captured.headers.Get("X-Gateway-Signature"),
+		"no signature header when no secret is configured")
+	assert.Empty(t, captured.headers.Get("X-Gateway-Ts"),
+		"no timestamp header when no secret is configured")
+}
+
+// TestInjectIdentity_ClientSuppliedSignatureHeadersAreStripped asserts a client cannot
+// pre-seed X-Gateway-Signature / X-Gateway-Ts: any inbound values MUST be stripped and
+// replaced by the gateway's own freshly-computed values (CONVENTIONS §24).
+func TestInjectIdentity_ClientSuppliedSignatureHeadersAreStripped(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "strip-sig-kid"
+	secret := []byte(testHMACSecret)
+	r, captured := setupIdentityTestRouterWithSecret(t, pub, kid, secret)
+
+	const fixedRequestID = "req-strip-0002"
+	tokenStr := generateToken(t, priv, kid, "strip-user", 1)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	req.Header.Set("X-Request-ID", fixedRequestID)
+	// Attacker pre-seeds both gateway-origin headers with bogus values.
+	req.Header.Set("X-Gateway-Ts", "9999999999")
+	req.Header.Set("X-Gateway-Signature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	ts := captured.headers.Get("X-Gateway-Ts")
+	assert.NotEqual(t, "9999999999", ts,
+		"client-supplied X-Gateway-Ts must be stripped, not forwarded")
+	gotSig := captured.headers.Get("X-Gateway-Signature")
+	assert.NotEqual(t,
+		"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", gotSig,
+		"client-supplied X-Gateway-Signature must be stripped, not forwarded")
+
+	// The surviving signature must be the gateway's own over the real values.
+	want := expectedSignature(secret, "strip-user", "1", "PERSONAL", "true", fixedRequestID, ts)
+	assert.Equal(t, want, gotSig,
+		"surviving signature must be the gateway's own HMAC over injected values")
+}
+
+// TestStripIdentityHeaders_StripsClientGatewaySignatureOnPublicRoute asserts the
+// global StripIdentityHeaders removes client-supplied X-Gateway-Signature / X-Gateway-Ts
+// on public/unauthenticated routes too — the signature path never reaches an upstream
+// from a public route, and a client can never pre-seed gateway-origin headers anywhere.
+func TestStripIdentityHeaders_StripsClientGatewaySignatureOnPublicRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	captured := &capturedRequest{}
+	r := gin.New()
+	r.Use(middleware.StripIdentityHeaders())
+
+	r.GET("/public/resource", func(c *gin.Context) {
+		captured.headers = c.Request.Header.Clone()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/public/resource", http.NoBody)
+	req.Header.Set("X-Gateway-Ts", "9999999999")
+	req.Header.Set("X-Gateway-Signature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Empty(t, captured.headers.Get("X-Gateway-Ts"),
+		"StripIdentityHeaders must remove client-supplied X-Gateway-Ts on public routes")
+	assert.Empty(t, captured.headers.Get("X-Gateway-Signature"),
+		"StripIdentityHeaders must remove client-supplied X-Gateway-Signature on public routes")
+}
+
+// TestInjectIdentity_EmptyFieldKeepsPipePositions asserts the empty-field rule: when an
+// injected value is empty (here X-Account-Type from a token with no accountType claim),
+// the canonical string keeps a stable empty field between the "|" separators, and the
+// gateway signs over that exact layout.
+func TestInjectIdentity_EmptyFieldKeepsPipePositions(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "empty-field-kid"
+	secret := []byte(testHMACSecret)
+	r, captured := setupIdentityTestRouterWithSecret(t, pub, kid, secret)
+
+	// Token with an EMPTY accountType claim — injected X-Account-Type is "".
+	now := time.Now().UTC()
+	claims := gojwt.MapClaims{
+		"iss":            jwt.Issuer,
+		"sub":            "empty-acct-user",
+		"aud":            jwt.Audience,
+		"iat":            now.Unix(),
+		"exp":            now.Add(10 * time.Minute).Unix(),
+		"kycTier":        1,
+		"accountType":    "", // empty field on purpose
+		"email_verified": true,
+	}
+	token := gojwt.NewWithClaims(gojwt.SigningMethodEdDSA, claims)
+	token.Header["kid"] = kid
+	tokenStr, err := token.SignedString(priv)
+	require.NoError(t, err)
+
+	const fixedRequestID = "req-empty-0003"
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	req.Header.Set("X-Request-ID", fixedRequestID)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, captured.headers.Get("X-Account-Type"),
+		"account type must be the empty injected value for this token")
+
+	ts := captured.headers.Get("X-Gateway-Ts")
+	require.NotEmpty(t, ts)
+	// Canonical string has an empty 3rd field but the "|" positions are preserved.
+	want := expectedSignature(secret, "empty-acct-user", "1", "", "true", fixedRequestID, ts)
+	assert.Equal(t, want, captured.headers.Get("X-Gateway-Signature"),
+		"empty field must keep its | position in the canonical string")
 }

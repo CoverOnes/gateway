@@ -125,3 +125,56 @@ func TestLoad_InvalidRateLimitRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "GATEWAY_RATE_LIMIT_PER_MIN")
 }
+
+// validProdSecret is a 32+ char value used to exercise the non-dev HMAC fail-fast.
+const validProdSecret = "prod-gateway-hmac-secret-0123456789ABCDEF"
+
+// TestLoad_DevAllowsEmptyHMACSecret asserts development mode does NOT require the
+// gateway-origin HMAC secret (signing is disabled in dev — parity with empty CORS).
+func TestLoad_DevAllowsEmptyHMACSecret(t *testing.T) {
+	minValidEnv(t) // GATEWAY_ENV=development, no GATEWAY_HMAC_SECRET
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.HMACSecret, "dev mode leaves the HMAC secret unset → signing disabled")
+}
+
+// TestLoad_NonDevRequiresHMACSecret asserts production/non-dev fails fast when the
+// gateway-origin HMAC secret is missing (CONVENTIONS §24).
+func TestLoad_NonDevRequiresHMACSecret(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "GATEWAY_ENV", "production") // no GATEWAY_HMAC_SECRET set
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_HMAC_SECRET")
+}
+
+// TestLoad_NonDevRejectsShortHMACSecret asserts a too-short secret is rejected in
+// non-dev: the minimum length bounds brute-force feasibility of the shared key.
+func TestLoad_NonDevRejectsShortHMACSecret(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t,
+		"GATEWAY_ENV", "production",
+		"GATEWAY_HMAC_SECRET", "too-short", // < 32 chars
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least 32 characters")
+}
+
+// TestLoad_NonDevWithValidHMACSecretPasses asserts a valid non-dev config loads and
+// the secret flows through to the Config struct unchanged.
+func TestLoad_NonDevWithValidHMACSecretPasses(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t,
+		"GATEWAY_ENV", "production",
+		"GATEWAY_HMAC_SECRET", validProdSecret,
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, validProdSecret, cfg.HMACSecret,
+		"GATEWAY_HMAC_SECRET must flow through to config unchanged")
+}

@@ -24,6 +24,9 @@ type RouterConfig struct {
 	RateLimitPerMin     int      // GATEWAY_RATE_LIMIT_PER_MIN; 0 → default 60
 	AuthRateLimitPerMin int      // GATEWAY_AUTH_RATE_LIMIT_PER_MIN; 0 → default 20
 	CORSOrigins         []string // GATEWAY_CORS_ORIGINS; nil/empty disables CORS headers
+	// HMACSecret signs the gateway-origin identity tuple (CONVENTIONS §24).
+	// Empty → signing disabled (development only; non-dev config fails fast).
+	HMACSecret []byte
 }
 
 // rateLimitOrDefault returns v if > 0, otherwise fallback.
@@ -43,7 +46,9 @@ func rateLimitOrDefault(v, fallback int) int {
 //
 // Returns an error if the proxy registry cannot be built (invalid route table).
 // Callers should handle the error and fail fast at boot rather than panic.
-func NewRouter(cfg RouterConfig) (*gin.Engine, error) {
+//
+// cfg is taken by pointer: RouterConfig is a heavy struct (read once at boot).
+func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
@@ -115,7 +120,7 @@ func NewRouter(cfg RouterConfig) (*gin.Engine, error) {
 	authGroup.POST(
 		"/logout",
 		authMW,
-		middleware.InjectIdentity(),
+		middleware.InjectIdentity(cfg.HMACSecret),
 		func(c *gin.Context) {
 			registry.Forward(c, "user")
 		},
@@ -125,7 +130,7 @@ func NewRouter(cfg RouterConfig) (*gin.Engine, error) {
 	// /api/:svc/* pattern with allowlist-only forwarding.
 	api := r.Group("/api/:svc")
 	api.Use(authMW)
-	api.Use(middleware.InjectIdentity())
+	api.Use(middleware.InjectIdentity(cfg.HMACSecret))
 	api.Any("/*proxyPath", proxyH.Forward)
 
 	return r, nil
@@ -185,7 +190,7 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		}
 	}
 
-	r, err := NewRouter(RouterConfig{
+	r, err := NewRouter(&RouterConfig{
 		Verifier:            verifier,
 		JWKSCache:           cache,
 		RouteTable:          table,
@@ -193,6 +198,7 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		RateLimitPerMin:     appCfg.RateLimitPerMin,
 		AuthRateLimitPerMin: appCfg.AuthRateLimitPerMin,
 		CORSOrigins:         corsOrigins,
+		HMACSecret:          []byte(appCfg.HMACSecret),
 	})
 	if err != nil {
 		return nil, err
