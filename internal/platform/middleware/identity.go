@@ -1,9 +1,24 @@
 package middleware
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+)
+
+// Gateway-origin signature headers (CONVENTIONS §24). The gateway HMAC-signs the
+// injected identity tuple so downstream services can prove the identity headers
+// came from the gateway, not from anything that can reach the service port on the
+// internal network. Defense-in-depth layered on the gateway-sole-JWT-verifier
+// model — NOT a replacement.
+const (
+	headerGatewayTs        = "X-Gateway-Ts"
+	headerGatewaySignature = "X-Gateway-Signature"
 )
 
 // identityHeaders lists all client-supplied identity headers that MUST be stripped
@@ -22,6 +37,12 @@ import (
 //
 // If a future claim (e.g. email/role) becomes gateway-vouched, it MUST be added
 // to InjectIdentity Step 2 below as well — adding it here alone only strips it.
+//
+// The two gateway-origin signature headers (X-Gateway-Ts, X-Gateway-Signature)
+// are ALSO stripped on every request: a client must never be able to pre-seed
+// them. Only InjectIdentity (Step 3) re-sets them, computed over the gateway's
+// own injected values. A request that reaches an upstream with these headers set
+// therefore proves they were produced by the gateway.
 var identityHeaders = []string{
 	"X-User-Id",
 	"X-Kyc-Tier",
@@ -29,6 +50,8 @@ var identityHeaders = []string{
 	"X-Email-Verified",
 	"X-User-Email",
 	"X-User-Role",
+	headerGatewayTs,
+	headerGatewaySignature,
 }
 
 // StripIdentityHeaders removes all identity headers from the inbound request.
@@ -51,9 +74,15 @@ func StripIdentityHeaders() gin.HandlerFunc {
 // InjectIdentity strips any client-supplied identity headers and replaces them with
 // values derived from the verified JWT claims. This is the anti-spoofing boundary.
 //
+// When hmacSecret is non-empty it ALSO sets the gateway-origin signature headers
+// (X-Gateway-Ts, X-Gateway-Signature) so downstream services can verify the
+// identity headers actually came from the gateway (CONVENTIONS §24). An empty
+// secret disables signing — used in development only; non-dev config fails fast
+// if the secret is unset (see config.validate).
+//
 // MUST run AFTER the Auth middleware — it reads claims from context.
 // Routes without Auth do NOT get InjectIdentity (they forward no identity headers).
-func InjectIdentity() gin.HandlerFunc {
+func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Step 1: STRIP all inbound identity headers (prevent client spoofing).
 		for _, h := range identityHeaders {
@@ -83,6 +112,50 @@ func InjectIdentity() gin.HandlerFunc {
 		// Neither side may drift to a different encoding (JSON bool / "1" / "True")
 		// without breaking the email-verified gate.
 		c.Request.Header.Set("X-Email-Verified", strconv.FormatBool(claims.EmailVerified))
+
+		// Pin the gateway-validated X-Request-ID onto the REQUEST header so the value
+		// signed over is exactly the value the proxy forwards downstream (proxy.go reads
+		// req.In.Header.Get("X-Request-ID")). RequestID() only writes the id to context
+		// + the response header, so without this pinning an inbound request with a
+		// missing/invalid client value would forward an EMPTY value while we signed over
+		// the gateway-generated one — a guaranteed downstream mismatch.
+		//
+		// NOTE on trust scope: X-Request-ID is client-proposable within a safe pattern
+		// (^[A-Za-z0-9_-]{1,64}$); invalid/empty values are replaced by a gateway-
+		// generated UUID. It is a CORRELATION field, NOT an authorization input.
+		// Downstream MUST NOT make authorization decisions based on X-Request-ID; its
+		// presence in the canonical string exists only to bind the signature to a single
+		// hop and prevent trivial replay — see CONVENTIONS §24.1.
+		rid := c.GetString("request_id")
+		c.Request.Header.Set("X-Request-ID", rid)
+
+		// Step 3: sign the injected identity tuple (defense-in-depth, CONVENTIONS §24).
+		// Skipped when no secret is configured (development only).
+		if len(hmacSecret) == 0 {
+			c.Next()
+
+			return
+		}
+
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		c.Request.Header.Set(headerGatewayTs, ts)
+
+		// Canonical string is locked by decision 2d8284a6: the literal VALUES of
+		// these headers joined by "|" in EXACTLY this order. Empty value => empty
+		// field, the "|" positions stay stable. Built from the FINAL injected
+		// values so it matches byte-for-byte what downstream recomputes.
+		canonical := strings.Join([]string{
+			c.Request.Header.Get("X-User-Id"),
+			c.Request.Header.Get("X-Kyc-Tier"),
+			c.Request.Header.Get("X-Account-Type"),
+			c.Request.Header.Get("X-Email-Verified"),
+			rid,
+			ts,
+		}, "|")
+
+		mac := hmac.New(sha256.New, hmacSecret)
+		mac.Write([]byte(canonical))
+		c.Request.Header.Set(headerGatewaySignature, hex.EncodeToString(mac.Sum(nil)))
 
 		c.Next()
 	}

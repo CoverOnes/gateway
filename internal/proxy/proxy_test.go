@@ -118,7 +118,7 @@ func TestProxy_AllowlistedServiceProxiedToUpstream(t *testing.T) {
 	defer upstream.Close()
 
 	routerCfg := buildRouter(t, pub, kid, upstream.URL)
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	tokenStr := signTestToken(t, priv, kid, "user-abc")
@@ -141,7 +141,7 @@ func TestProxy_UnknownServiceReturns404(t *testing.T) {
 	defer upstream.Close()
 
 	routerCfg := buildRouter(t, pub, kid, upstream.URL)
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	tokenStr := signTestToken(t, priv, kid, "user-abc")
@@ -164,7 +164,7 @@ func TestProxy_InboundSpoofedIdentityHeaderIsStripped(t *testing.T) {
 	defer upstream.Close()
 
 	routerCfg := buildRouter(t, pub, kid, upstream.URL)
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	tokenStr := signTestToken(t, priv, kid, "real-sub")
@@ -205,7 +205,7 @@ func TestProxy_Upstream5xxSurfacesGeneric502(t *testing.T) {
 	defer upstream.Close()
 
 	routerCfg := buildRouter(t, pub, kid, upstream.URL)
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	tokenStr := signTestToken(t, priv, kid, "user-abc")
@@ -235,7 +235,7 @@ func TestProxy_PublicRoutesDoNotRequireAuth(t *testing.T) {
 	defer upstream.Close()
 
 	routerCfg := buildRouter(t, pub, kid, upstream.URL)
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	// POST /v1/auth/register should work WITHOUT Authorization header.
@@ -260,7 +260,7 @@ func TestProxy_SpoofedIdentityHeaderStrippedOnPublicRoute(t *testing.T) {
 	defer upstream.Close()
 
 	routerCfg := buildRouter(t, pub, kid, upstream.URL)
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	// Client sends spoofed identity header on public login route (no auth token).
@@ -288,7 +288,7 @@ func TestProxy_HealthzNeverRequiresAuth(t *testing.T) {
 	defer upstream.Close()
 
 	routerCfg := buildRouter(t, pub, kid, upstream.URL)
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", http.NoBody)
@@ -313,7 +313,7 @@ func TestProxy_ReadyzReflectsJWKSCacheState(t *testing.T) {
 	h := health.NewHandler(routerCfg.JWKSCache)
 	_ = h
 
-	r, err := handler.NewRouter(*routerCfg)
+	r, err := handler.NewRouter(routerCfg)
 	require.NoError(t, err)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/readyz", http.NoBody)

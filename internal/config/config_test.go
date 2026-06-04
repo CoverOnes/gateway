@@ -103,7 +103,8 @@ func TestLoad_Defaults(t *testing.T) {
 // reflected in the Config struct (G-M2: config values must not be discarded).
 func TestLoad_RateLimitValuesFlowThroughConfig(t *testing.T) {
 	minValidEnv(t)
-	setEnv(t,
+	setEnv(
+		t,
 		"GATEWAY_RATE_LIMIT_PER_MIN", "120",
 		"GATEWAY_AUTH_RATE_LIMIT_PER_MIN", "40",
 	)
@@ -124,4 +125,114 @@ func TestLoad_InvalidRateLimitRejected(t *testing.T) {
 	_, err := config.Load()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "GATEWAY_RATE_LIMIT_PER_MIN")
+}
+
+// validProdSecret is a 32+ char value used to exercise the non-dev HMAC fail-fast.
+const validProdSecret = "prod-gateway-hmac-secret-0123456789ABCDEF"
+
+// TestLoad_DevAllowsEmptyHMACSecret asserts development mode does NOT require the
+// gateway-origin HMAC secret (signing is disabled in dev — parity with empty CORS).
+func TestLoad_DevAllowsEmptyHMACSecret(t *testing.T) {
+	minValidEnv(t) // GATEWAY_ENV=development, no GATEWAY_HMAC_SECRET
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.HMACSecret, "dev mode leaves the HMAC secret unset → signing disabled")
+}
+
+// TestLoad_NonDevRequiresHMACSecret asserts production/non-dev fails fast when the
+// gateway-origin HMAC secret is missing (CONVENTIONS §24).
+func TestLoad_NonDevRequiresHMACSecret(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "GATEWAY_ENV", "production") // no GATEWAY_HMAC_SECRET set
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_HMAC_SECRET")
+}
+
+// TestLoad_NonDevRejectsShortHMACSecret asserts a too-short secret is rejected in
+// non-dev: the minimum length bounds brute-force feasibility of the shared key.
+func TestLoad_NonDevRejectsShortHMACSecret(t *testing.T) {
+	minValidEnv(t)
+	setEnv(
+		t,
+		"GATEWAY_ENV", "production",
+		"GATEWAY_HMAC_SECRET", "too-short", // < 32 chars
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least 32 characters")
+}
+
+// TestLoad_NonDevWithValidHMACSecretPasses asserts a valid non-dev config loads and
+// the secret flows through to the Config struct unchanged.
+func TestLoad_NonDevWithValidHMACSecretPasses(t *testing.T) {
+	minValidEnv(t)
+	setEnv(
+		t,
+		"GATEWAY_ENV", "production",
+		"GATEWAY_HMAC_SECRET", validProdSecret,
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, validProdSecret, cfg.HMACSecret,
+		"GATEWAY_HMAC_SECRET must flow through to config unchanged")
+}
+
+// TestLoad_EnvMustBeExplicitlySet asserts that omitting GATEWAY_ENV entirely causes a
+// boot-time validation error. Without this, an unset env var would have previously
+// defaulted to "development" (via viper.SetDefault), silently disabling HMAC signing
+// in production. The env variable must now be explicitly set (fail-closed).
+func TestLoad_EnvMustBeExplicitlySet(t *testing.T) {
+	minValidEnv(t)
+	os.Unsetenv("GATEWAY_ENV") //nolint:errcheck // test cleanup; t.Setenv restores on test end
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_ENV")
+}
+
+// TestLoad_UnknownEnvValueIsRejected asserts that an unrecognized GATEWAY_ENV value
+// (e.g. "prod" — a common abbreviation that is NOT an allowed token) causes a
+// validation error. This prevents a misconfigured deploy from running in an ambiguous
+// state where the gateway behavior is undefined.
+func TestLoad_UnknownEnvValueIsRejected(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "GATEWAY_ENV", "prod") // common abbreviation, NOT an allowed value
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_ENV")
+}
+
+// TestLoad_StagingEnvWithHMACSecretPasses asserts that "staging" is a valid GATEWAY_ENV
+// and — because staging is non-dev — also requires GATEWAY_HMAC_SECRET. This exercises
+// the !IsDev() gate and verifies staging is treated identically to production for the
+// HMAC requirement.
+func TestLoad_StagingEnvWithHMACSecretPasses(t *testing.T) {
+	minValidEnv(t)
+	setEnv(
+		t,
+		"GATEWAY_ENV", "staging",
+		"GATEWAY_HMAC_SECRET", validProdSecret,
+	)
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.IsDev(), "staging must not be treated as development")
+	assert.Equal(t, validProdSecret, cfg.HMACSecret)
+}
+
+// TestLoad_StagingWithoutHMACSecretFails asserts staging requires the HMAC secret:
+// the HMAC fail-fast must fire on staging just as it does on production.
+func TestLoad_StagingWithoutHMACSecretFails(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "GATEWAY_ENV", "staging") // no GATEWAY_HMAC_SECRET
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_HMAC_SECRET")
 }
