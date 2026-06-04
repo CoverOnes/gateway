@@ -12,8 +12,9 @@ import (
 // Implicit contract — strip-list vs inject-list are deliberately asymmetric:
 //   - ALL headers below are STRIPPED on every request (StripIdentityHeaders +
 //     InjectIdentity Step 1), so a client can never spoof any of them.
-//   - Only X-User-Id, X-Kyc-Tier, and X-Account-Type are RE-INJECTED from the
-//     verified JWT claims (InjectIdentity Step 2). Upstreams may trust these.
+//   - Only X-User-Id, X-Kyc-Tier, X-Account-Type, and X-Email-Verified are
+//     RE-INJECTED from the verified JWT claims (InjectIdentity Step 2). Upstreams
+//     may trust these.
 //   - X-User-Email and X-User-Role are intentionally NOT injected: the gateway
 //     does not vouch for them. They appear here only to be stripped — upstreams
 //     must NEVER treat an inbound X-User-Email / X-User-Role as authoritative,
@@ -25,6 +26,7 @@ var identityHeaders = []string{
 	"X-User-Id",
 	"X-Kyc-Tier",
 	"X-Account-Type",
+	"X-Email-Verified",
 	"X-User-Email",
 	"X-User-Role",
 }
@@ -71,6 +73,10 @@ func InjectIdentity() gin.HandlerFunc {
 		c.Request.Header.Set("X-User-Id", claims.Subject)
 		c.Request.Header.Set("X-Kyc-Tier", strconv.Itoa(int(claims.KYCTier)))
 		c.Request.Header.Set("X-Account-Type", claims.AccountType)
+		// Fail-safe: an older token without the email_verified claim leaves
+		// claims.EmailVerified at its zero value (false), so this injects
+		// "false" — never an empty or "true" header for an unverified user.
+		c.Request.Header.Set("X-Email-Verified", strconv.FormatBool(claims.EmailVerified))
 
 		c.Next()
 	}

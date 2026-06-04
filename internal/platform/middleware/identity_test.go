@@ -56,6 +56,17 @@ func setupIdentityTestRouter(t *testing.T, pub ed25519.PublicKey, kid string) (*
 func generateToken(t *testing.T, priv ed25519.PrivateKey, kid, sub string, kycTier int16) string {
 	t.Helper()
 
+	return generateTokenWithEmailVerified(t, priv, kid, sub, kycTier, true)
+}
+
+// generateTokenWithEmailVerified mirrors generateToken but lets a test control the
+// email_verified claim, so the X-Email-Verified injection can be exercised for both
+// verified and unverified users.
+func generateTokenWithEmailVerified(
+	t *testing.T, priv ed25519.PrivateKey, kid, sub string, kycTier int16, emailVerified bool,
+) string {
+	t.Helper()
+
 	now := time.Now().UTC()
 	claims := &jwt.Claims{
 		RegisteredClaims: gojwt.RegisteredClaims{
@@ -65,8 +76,37 @@ func generateToken(t *testing.T, priv ed25519.PrivateKey, kid, sub string, kycTi
 			IssuedAt:  gojwt.NewNumericDate(now),
 			ExpiresAt: gojwt.NewNumericDate(now.Add(10 * time.Minute)),
 		},
-		KYCTier:     kycTier,
-		AccountType: "PERSONAL",
+		KYCTier:       kycTier,
+		AccountType:   "PERSONAL",
+		EmailVerified: emailVerified,
+	}
+
+	token := gojwt.NewWithClaims(gojwt.SigningMethodEdDSA, claims)
+	token.Header["kid"] = kid
+
+	signed, err := token.SignedString(priv)
+	require.NoError(t, err)
+
+	return signed
+}
+
+// generateLegacyToken builds a token whose raw JSON entirely OMITS the email_verified
+// claim, simulating an older user-service release issued before auth Increment 1.
+// It cannot use the Claims struct (which always serializes the field), so it signs a
+// raw jwt.MapClaims with only the pre-Increment-1 fields present.
+func generateLegacyToken(t *testing.T, priv ed25519.PrivateKey, kid, sub string) string {
+	t.Helper()
+
+	now := time.Now().UTC()
+	claims := gojwt.MapClaims{
+		"iss":         jwt.Issuer,
+		"sub":         sub,
+		"aud":         jwt.Audience,
+		"iat":         now.Unix(),
+		"exp":         now.Add(10 * time.Minute).Unix(),
+		"kycTier":     0,
+		"accountType": "PERSONAL",
+		// email_verified deliberately absent.
 	}
 
 	token := gojwt.NewWithClaims(gojwt.SigningMethodEdDSA, claims)
@@ -126,6 +166,96 @@ func TestInjectIdentity_KycTierInjectedFromClaims(t *testing.T) {
 	// Tier must be 0 from JWT, not 3 from client.
 	assert.Equal(t, "0", captured.headers.Get("X-Kyc-Tier"),
 		"X-Kyc-Tier must reflect JWT claims, not spoofed client value")
+}
+
+func TestInjectIdentity_EmailVerifiedInjectedFromClaims(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		emailVerf bool
+		// spoofHeader is a client-supplied X-Email-Verified value that MUST be
+		// overridden by the value derived from the verified JWT claim.
+		spoofHeader string
+		wantHeader  string
+	}{
+		{
+			name:        "verified user yields true",
+			emailVerf:   true,
+			spoofHeader: "",
+			wantHeader:  "true",
+		},
+		{
+			name:        "unverified user yields false",
+			emailVerf:   false,
+			spoofHeader: "",
+			wantHeader:  "false",
+		},
+		{
+			name:        "spoofed true on unverified user is overridden to false",
+			emailVerf:   false,
+			spoofHeader: "true", // attacker forges a verified header
+			wantHeader:  "false",
+		},
+		{
+			name:        "spoofed false on verified user is overridden to true",
+			emailVerf:   true,
+			spoofHeader: "false",
+			wantHeader:  "true",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			pub, priv, err := ed25519.GenerateKey(rand.Reader)
+			require.NoError(t, err)
+
+			kid := "email-verified-test-kid"
+			r, captured := setupIdentityTestRouter(t, pub, kid)
+
+			tokenStr := generateTokenWithEmailVerified(t, priv, kid, "user-ev", 1, tc.emailVerf)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+			if tc.spoofHeader != "" {
+				req.Header.Set("X-Email-Verified", tc.spoofHeader)
+			}
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, tc.wantHeader, captured.headers.Get("X-Email-Verified"),
+				"X-Email-Verified must reflect the verified JWT claim, never the client header")
+		})
+	}
+}
+
+// TestInjectIdentity_LegacyTokenWithoutEmailVerifiedDefaultsFalse ensures the
+// fail-safe default: a token issued before the email_verified claim existed must
+// produce X-Email-Verified: false, never an empty or "true" header.
+func TestInjectIdentity_LegacyTokenWithoutEmailVerifiedDefaultsFalse(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "legacy-token-test-kid"
+	r, captured := setupIdentityTestRouter(t, pub, kid)
+
+	tokenStr := generateLegacyToken(t, priv, kid, "legacy-user")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "false", captured.headers.Get("X-Email-Verified"),
+		"older token without email_verified claim must fail safe to X-Email-Verified: false")
 }
 
 func TestStripIdentityHeaders_PublicRouteDropsClientIdentity(t *testing.T) {

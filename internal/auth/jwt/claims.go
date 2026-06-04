@@ -24,6 +24,12 @@ type Claims struct {
 	// AccountType is PERSONAL or COMPANY.
 	AccountType string `json:"accountType"`
 
+	// EmailVerified reports whether the user has verified their email address
+	// (auth Increment 1). Older tokens issued before this claim existed omit it;
+	// JSON unmarshalling then leaves this at its zero value (false), which is the
+	// fail-safe default the gateway relies on when injecting X-Email-Verified.
+	EmailVerified bool `json:"email_verified"`
+
 	// TokenVersion is intentionally NOT validated at the gateway layer.
 	// Token revocation is enforced by refresh-token family invalidation at the
 	// user service: when a refresh family is revoked, the user service rejects
