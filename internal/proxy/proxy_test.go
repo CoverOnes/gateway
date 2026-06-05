@@ -381,8 +381,26 @@ func TestProxy_InternalPathBlocked(t *testing.T) {
 			wantUpstreamHit: false,
 		},
 		{
+			name:            "capital-case Internal segment is blocked (case-insensitive)",
+			publicPath:      "/api/user/Internal/v1/resource",
+			wantStatus:      http.StatusNotFound,
+			wantUpstreamHit: false,
+		},
+		{
+			name:            "all-caps INTERNAL segment is blocked (case-insensitive)",
+			publicPath:      "/api/user/INTERNAL/v1/resource",
+			wantStatus:      http.StatusNotFound,
+			wantUpstreamHit: false,
+		},
+		{
 			name:            "normal public path is NOT blocked",
 			publicPath:      "/api/user/v1/me",
+			wantStatus:      http.StatusOK,
+			wantUpstreamHit: true,
+		},
+		{
+			name:            "internalize substring is NOT over-blocked",
+			publicPath:      "/api/user/v1/internalize/resource",
 			wantStatus:      http.StatusOK,
 			wantUpstreamHit: true,
 		},

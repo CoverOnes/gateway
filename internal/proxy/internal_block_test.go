@@ -109,6 +109,21 @@ func TestContainsInternalSegment(t *testing.T) {
 			cleanedPath: "/v1/foo/internal",
 			want:        true,
 		},
+		{
+			name:        "capital-I Internal is blocked (case-insensitive)",
+			cleanedPath: "/Internal/v1/kyc/abc/status",
+			want:        true,
+		},
+		{
+			name:        "all-caps INTERNAL is blocked (case-insensitive)",
+			cleanedPath: "/INTERNAL/v1/status",
+			want:        true,
+		},
+		{
+			name:        "mixed-case iNtErNaL is blocked (case-insensitive)",
+			cleanedPath: "/v1/iNtErNaL/bar",
+			want:        true,
+		},
 		// Paths that MUST NOT be blocked — "internal" is a substring but not a segment
 		{
 			name:        "internalize is not internal",

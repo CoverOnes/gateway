@@ -121,12 +121,18 @@ func upstreamPath(requestPath, svc string) string {
 
 // containsInternalSegment reports whether the normalized upstream path would
 // route to an /internal/ endpoint — i.e. any path segment in the cleaned path
-// equals "internal".
+// equals "internal" (case-insensitively).
+//
+// The comparison is case-insensitive on purpose: the guard's correctness must
+// not depend on upstream routing being case-sensitive. A future upstream using
+// a case-insensitive framework (Spring, Express with case-insensitive routing,
+// etc.) would otherwise be reachable via /Internal/ or /INTERNAL/.
 //
 // Examples that return true:
 //
 //	/internal/v1/kyc/abc/status
 //	/v1/foo/internal/bar
+//	/Internal/v1/status  and  /INTERNAL/v1/status   (case-insensitive)
 //	result of /api/kyc/foo/../internal/status (resolves to /internal/status)
 //	result of /api/kyc/%2finternal/v1   (decoded to /internal/v1)
 func containsInternalSegment(cleanedPath string) bool {
@@ -134,7 +140,7 @@ func containsInternalSegment(cleanedPath string) bool {
 	// path.Clean guarantees no leading "//" and no trailing "/" (unless root),
 	// so splitting is safe.
 	for _, seg := range strings.Split(cleanedPath, "/") {
-		if seg == "internal" {
+		if strings.EqualFold(seg, "internal") {
 			return true
 		}
 	}
