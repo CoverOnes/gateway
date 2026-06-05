@@ -50,6 +50,8 @@ type Config struct {
 	// Rate limiting
 	RateLimitPerMin     int `mapstructure:"rate_limit_per_min"`      // GATEWAY_RATE_LIMIT_PER_MIN
 	AuthRateLimitPerMin int `mapstructure:"auth_rate_limit_per_min"` // GATEWAY_AUTH_RATE_LIMIT_PER_MIN
+	UserRateLimitPerMin int `mapstructure:"user_rate_limit_per_min"` // GATEWAY_USER_RATE_LIMIT_PER_MIN (default 300)
+	UserRateLimitBurst  int `mapstructure:"user_rate_limit_burst"`   // GATEWAY_USER_RATE_LIMIT_BURST (default 30)
 
 	// Proxy
 	ProxyTimeoutSec int `mapstructure:"proxy_timeout_sec"` // GATEWAY_PROXY_TIMEOUT_SEC
@@ -82,6 +84,8 @@ func Load() (*Config, error) {
 		"cors_origins":            "GATEWAY_CORS_ORIGINS",
 		"rate_limit_per_min":      "GATEWAY_RATE_LIMIT_PER_MIN",
 		"auth_rate_limit_per_min": "GATEWAY_AUTH_RATE_LIMIT_PER_MIN",
+		"user_rate_limit_per_min": "GATEWAY_USER_RATE_LIMIT_PER_MIN",
+		"user_rate_limit_burst":   "GATEWAY_USER_RATE_LIMIT_BURST",
 		"proxy_timeout_sec":       "GATEWAY_PROXY_TIMEOUT_SEC",
 		// USER_ prefixed keys (shared with user service).
 		"jwks_user_url":     "USER_JWKS_URL",
@@ -108,6 +112,8 @@ func Load() (*Config, error) {
 	v.SetDefault("jwt_leeway_sec", 60)
 	v.SetDefault("rate_limit_per_min", 60)
 	v.SetDefault("auth_rate_limit_per_min", 20)
+	v.SetDefault("user_rate_limit_per_min", 300)
+	v.SetDefault("user_rate_limit_burst", 30)
 	v.SetDefault("proxy_timeout_sec", 30)
 
 	var cfg Config
@@ -168,6 +174,14 @@ func (c *Config) validate() error {
 
 	if c.AuthRateLimitPerMin <= 0 {
 		errs = append(errs, "GATEWAY_AUTH_RATE_LIMIT_PER_MIN must be > 0")
+	}
+
+	if c.UserRateLimitPerMin <= 0 {
+		errs = append(errs, "GATEWAY_USER_RATE_LIMIT_PER_MIN must be > 0")
+	}
+
+	if c.UserRateLimitBurst <= 0 {
+		errs = append(errs, "GATEWAY_USER_RATE_LIMIT_BURST must be > 0")
 	}
 
 	if c.ProxyTimeoutSec <= 0 {
