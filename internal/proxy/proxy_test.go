@@ -323,3 +323,95 @@ func TestProxy_ReadyzReflectsJWKSCacheState(t *testing.T) {
 	// Cache was populated in buildRouter, so /readyz should be 200.
 	assert.Equal(t, http.StatusOK, w.Code)
 }
+
+// ─── Internal-path blocking tests ─────────────────────────────────────────────
+//
+// These tests verify the defense-in-depth guard that refuses to proxy any
+// request whose resolved upstream path contains an "internal" segment.
+// All requests go through the full Gin + Auth + Proxy stack to confirm that
+// the block fires correctly at the proxy layer for every evasion variant.
+
+// TestProxy_InternalPathBlocked is a table-driven test covering:
+//   - direct /internal/ prefix
+//   - /internal/ segment in the middle of the path
+//   - URL-encoded %2finternal evasion
+//   - ../ traversal that resolves to /internal/
+//   - a normal public path that MUST NOT be blocked (regression guard)
+func TestProxy_InternalPathBlocked(t *testing.T) {
+	pub, priv, kid := generateEdDSAKey(t)
+
+	capturer := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tokenStr := signTestToken(t, priv, kid, "user-internal-test")
+
+	tests := []struct {
+		name            string
+		publicPath      string
+		wantStatus      int
+		wantUpstreamHit bool // true iff we expect the upstream capturer to be reached
+	}{
+		{
+			name:            "direct internal prefix is blocked",
+			publicPath:      "/api/user/internal/v1/kyc/abc123/status",
+			wantStatus:      http.StatusNotFound,
+			wantUpstreamHit: false,
+		},
+		{
+			name:            "internal segment in mid-path is blocked",
+			publicPath:      "/api/user/v1/foo/internal/bar",
+			wantStatus:      http.StatusNotFound,
+			wantUpstreamHit: false,
+		},
+		{
+			name:            "URL-encoded slash before internal is blocked",
+			publicPath:      "/api/user/%2finternal/v1",
+			wantStatus:      http.StatusNotFound,
+			wantUpstreamHit: false,
+		},
+		{
+			name:            "dot-dot traversal into internal is blocked",
+			publicPath:      "/api/user/foo/../internal/v1/status",
+			wantStatus:      http.StatusNotFound,
+			wantUpstreamHit: false,
+		},
+		{
+			name:            "normal public path is NOT blocked",
+			publicPath:      "/api/user/v1/me",
+			wantStatus:      http.StatusOK,
+			wantUpstreamHit: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reset the capturer between sub-tests so we can detect upstream hits.
+			capturer.receivedPath = ""
+			capturer.responseStatus = http.StatusOK
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.publicPath, http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, tc.wantStatus, w.Code, "unexpected status for path %q", tc.publicPath)
+
+			if tc.wantUpstreamHit {
+				assert.NotEmpty(t, capturer.receivedPath,
+					"expected upstream to be reached for public path %q", tc.publicPath)
+			} else {
+				assert.Empty(t, capturer.receivedPath,
+					"upstream must NOT be reached for blocked path %q", tc.publicPath)
+				// 404 body must not reveal that the endpoint exists (no "internal" keyword).
+				assert.NotContains(t, w.Body.String(), "internal",
+					"404 body must not reveal internal path details")
+			}
+		})
+	}
+}
