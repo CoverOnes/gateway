@@ -127,13 +127,25 @@ TLS 1.3 terminated at edge (Railway / ingress) — services themselves listen pl
 ## 9. Middleware Chain Order
 
 ```
-recover -> request-id -> security-headers -> strip-identity-headers -> slog access-log
-  -> CORS -> global-IP-rate-limit -> public groups
-  -> protected groups: Auth -> PerUserRateLimit(claims.Subject, 300/min) -> InjectIdentity -> forward
+CORS (preflight must be handled first)
+  -> recover -> request-id -> security-headers -> strip-identity-headers -> slog access-log
+  -> [health: /healthz, /readyz — registered before ipRL, never rate-limited]
+  -> global-IP-rate-limit (ipRL)
+  -> public groups (/jwks, /v1/auth/register, /v1/auth/login, /v1/auth/refresh, authRL)
+  -> /v1/auth/logout: NoCache -> Auth -> PerUserRateLimit -> InjectIdentity -> forward
+     (NOT gated by authRL — see note below)
+  -> protected groups /api/:svc: Auth -> PerUserRateLimit(claims.Subject) -> InjectIdentity -> forward
 ```
 
+- CORS runs FIRST (before Recover/RequestID): preflight OPTIONS requests must not be rejected
+  by rate limiters or other middleware.
+- Health endpoints (`/healthz`, `/readyz`) are registered before `ipRL` and bypass the global
+  IP rate limit so liveness/readiness probes are never throttled.
 - Deny-by-default: routes without explicit auth + min-tier declaration are NOT registered.
-- Global IP rate limit (`ipRL`) guards all routes before any auth decision.
+- Global IP rate limit (`ipRL`) guards all non-health routes before any auth decision.
+- Logout is intentionally outside the IP-keyed `authRL` group: behind shared NAT, 20+ users
+  logging out simultaneously would hit the 20/min IP cap and be unable to invalidate their
+  sessions. Logout uses `userRL` (JWT-subject-keyed) so each user has an independent budget.
 - Per-user rate limit (`userRL`) is keyed on JWT subject (user UUID); placed AFTER Auth so
   the key is always the verified identity, never a client-supplied value. Placed BEFORE
   InjectIdentity so a rate-limited request is rejected before downstream services are involved.

@@ -127,6 +127,39 @@ func TestLoad_InvalidRateLimitRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "GATEWAY_RATE_LIMIT_PER_MIN")
 }
 
+// TestLoad_UserRateLimitBurstFlowsThrough verifies GATEWAY_USER_RATE_LIMIT_BURST is
+// loaded from env and reflected in the Config struct.
+func TestLoad_UserRateLimitBurstFlowsThrough(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "GATEWAY_USER_RATE_LIMIT_BURST", "50")
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, 50, cfg.UserRateLimitBurst,
+		"GATEWAY_USER_RATE_LIMIT_BURST must be loaded from env and reflected in Config")
+}
+
+// TestLoad_UserRateLimitBurstDefaultIs30 verifies the default burst is 30.
+func TestLoad_UserRateLimitBurstDefaultIs30(t *testing.T) {
+	minValidEnv(t)
+	os.Unsetenv("GATEWAY_USER_RATE_LIMIT_BURST") //nolint:errcheck // test cleanup
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, 30, cfg.UserRateLimitBurst,
+		"GATEWAY_USER_RATE_LIMIT_BURST must default to 30")
+}
+
+// TestLoad_UserRateLimitBurstZeroRejected ensures burst=0 is rejected at boot.
+func TestLoad_UserRateLimitBurstZeroRejected(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "GATEWAY_USER_RATE_LIMIT_BURST", "0")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_USER_RATE_LIMIT_BURST")
+}
+
 // validProdSecret is a 32+ char value used to exercise the non-dev HMAC fail-fast.
 const validProdSecret = "prod-gateway-hmac-secret-0123456789ABCDEF"
 

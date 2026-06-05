@@ -17,7 +17,9 @@ import (
 // high account-rotation attacks.
 const userFallbackLRUCap = 100_000
 
-// fallbackBurst is the token-bucket burst for the in-process limiter.
+// fallbackBurst is the token-bucket burst for the in-process IP-keyed limiters
+// (IPRateLimiter and AuthRateLimiter). It does NOT apply to UserRateLimiter,
+// which uses a separately configurable burst via NewUserRateLimiter.
 // Set conservatively: 10 requests per second per IP.
 const fallbackBurst = 10
 
@@ -127,8 +129,9 @@ type UserRateLimiter struct {
 }
 
 // NewUserRateLimiter builds a per-authenticated-user rate limiter with the given
-// per-minute budget. The limiter is keyed on JWT subject (user UUID).
-func NewUserRateLimiter(limitPerMin int) *UserRateLimiter {
+// per-minute budget and burst size. The limiter is keyed on JWT subject (user UUID).
+// burst must be > 0; caller is responsible for validating this at config load time.
+func NewUserRateLimiter(limitPerMin, burst int) *UserRateLimiter {
 	r := rate.Limit(float64(limitPerMin) / 60.0)
 
 	cache, err := lru.New[string, *rate.Limiter](userFallbackLRUCap)
@@ -140,7 +143,7 @@ func NewUserRateLimiter(limitPerMin int) *UserRateLimiter {
 	return &UserRateLimiter{
 		buckets: cache,
 		r:       r,
-		burst:   fallbackBurst,
+		burst:   burst,
 	}
 }
 

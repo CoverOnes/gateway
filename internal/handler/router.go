@@ -24,6 +24,7 @@ type RouterConfig struct {
 	RateLimitPerMin     int      // GATEWAY_RATE_LIMIT_PER_MIN; 0 → default 60
 	AuthRateLimitPerMin int      // GATEWAY_AUTH_RATE_LIMIT_PER_MIN; 0 → default 20
 	UserRateLimitPerMin int      // GATEWAY_USER_RATE_LIMIT_PER_MIN; 0 → default 300
+	UserRateLimitBurst  int      // GATEWAY_USER_RATE_LIMIT_BURST; 0 → default 30
 	CORSOrigins         []string // GATEWAY_CORS_ORIGINS; nil/empty disables CORS headers
 	// HMACSecret signs the gateway-origin identity tuple (CONVENTIONS §24).
 	// Empty → signing disabled (development only; non-dev config fails fast).
@@ -41,10 +42,13 @@ func rateLimitOrDefault(v, fallback int) int {
 
 // NewRouter builds and returns the configured Gin engine.
 // Route chain order per CONVENTIONS.md §9:
-// Recover -> RequestID -> SecurityHeaders -> StripIdentityHeaders -> accessLogger
-// -> [health+jwks pre-ratelimit]
-// -> GlobalIPRateLimit -> public passthrough groups
-// -> protected proxy groups (Auth -> PerUserRateLimit(claims.Subject, 300/min) -> InjectIdentity -> Forward)
+// CORS (first — preflight must not be blocked by later middleware)
+// -> Recover -> RequestID -> SecurityHeaders -> StripIdentityHeaders -> accessLogger
+// -> [health /healthz /readyz — registered before ipRL, never rate-limited]
+// -> GlobalIPRateLimit
+// -> /jwks + authGroup (register, login, refresh, verify-email, resend-verification) with authRL
+// -> /v1/auth/logout (NOT in authGroup — uses NoCache + authMW + userRL only, no authRL)
+// -> protected proxy groups /api/:svc (Auth -> PerUserRateLimit(claims.Subject) -> InjectIdentity -> Forward)
 //
 // Returns an error if the proxy registry cannot be built (invalid route table).
 // Callers should handle the error and fail fast at boot rather than panic.
@@ -117,16 +121,25 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 		registry.Forward(c, "user")
 	})
 
-	// Logout requires a valid access token — protected.
-	authMW := middleware.Auth(cfg.Verifier)
 	// Per-user rate limiter: keyed on JWT subject (user UUID).
 	// Placed AFTER Auth (which validates the JWT and injects claims) so the key is always
 	// the authenticated user identity, never an attacker-supplied value.
 	// Placed BEFORE InjectIdentity so a rate-limited request is rejected before downstream
 	// services are involved at all.
-	userRL := middleware.NewUserRateLimiter(rateLimitOrDefault(cfg.UserRateLimitPerMin, 300))
-	authGroup.POST(
-		"/logout",
+	authMW := middleware.Auth(cfg.Verifier)
+	userRL := middleware.NewUserRateLimiter(
+		rateLimitOrDefault(cfg.UserRateLimitPerMin, 300),
+		rateLimitOrDefault(cfg.UserRateLimitBurst, 30),
+	)
+
+	// Logout requires a valid access token and is intentionally NOT inside authGroup so it
+	// does NOT inherit the IP-keyed authRL limiter. Behind shared NAT, 20+ users logging
+	// out concurrently would otherwise be blocked from invalidating their sessions.
+	// Logout is keyed on JWT subject (via userRL) — not on IP — so per-user enforcement
+	// still applies without punishing legitimate users sharing an egress IP.
+	r.POST(
+		"/v1/auth/logout",
+		middleware.NoCache(),
 		authMW,
 		userRL.Handler(),
 		middleware.InjectIdentity(cfg.HMACSecret),
@@ -208,6 +221,7 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		RateLimitPerMin:     appCfg.RateLimitPerMin,
 		AuthRateLimitPerMin: appCfg.AuthRateLimitPerMin,
 		UserRateLimitPerMin: appCfg.UserRateLimitPerMin,
+		UserRateLimitBurst:  appCfg.UserRateLimitBurst,
 		CORSOrigins:         corsOrigins,
 		HMACSecret:          []byte(appCfg.HMACSecret),
 	})

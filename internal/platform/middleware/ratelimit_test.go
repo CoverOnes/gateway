@@ -136,10 +136,10 @@ func TestAuthRateLimiter_HasIndependentBucketFromIPLimiter(t *testing.T) {
 // TestUserRateLimiter_PerUserIsolation is the core per-user DoS-fix test:
 // exhausting user-A's budget must NOT block user-B.
 func TestUserRateLimiter_PerUserIsolation(t *testing.T) {
-	// Use limit=fallbackBurst so the burst allows exactly fallbackBurst(10) requests,
-	// then the 11th is rejected.  Use limit equal to burst to keep the test deterministic.
-	const limitPerMin = fallbackBurst // 10 — same as burst so bucket drains predictably
-	lim := NewUserRateLimiter(limitPerMin)
+	// Use burst=10 and limit=burst so the bucket drains predictably after exactly burst requests.
+	const burst = 10
+	const limitPerMin = burst
+	lim := NewUserRateLimiter(limitPerMin, burst)
 	r := newRLTestEngine(t, lim.Handler())
 
 	// Exhaust user-A's budget.
@@ -158,8 +158,9 @@ func TestUserRateLimiter_PerUserIsolation(t *testing.T) {
 // TestUserRateLimiter_ExhaustedBudgetReturns429 proves the limiter is actually
 // enforcing: after burst tokens are consumed, the next request is rejected 429.
 func TestUserRateLimiter_ExhaustedBudgetReturns429(t *testing.T) {
-	const limitPerMin = fallbackBurst
-	lim := NewUserRateLimiter(limitPerMin)
+	const burst = 10
+	const limitPerMin = burst
+	lim := NewUserRateLimiter(limitPerMin, burst)
 	r := newRLTestEngine(t, lim.Handler())
 
 	const subjectA = "user-uuid-cccc"
@@ -169,11 +170,31 @@ func TestUserRateLimiter_ExhaustedBudgetReturns429(t *testing.T) {
 		"user-A must receive a 429 after exhausting the per-user budget (fail-closed)")
 }
 
+// TestUserRateLimiter_HonorsConfiguredBurst verifies that the user limiter respects the
+// burst parameter passed to NewUserRateLimiter. With burst=2, the 3rd immediate request
+// must receive 429 regardless of the per-minute limit.
+func TestUserRateLimiter_HonorsConfiguredBurst(t *testing.T) {
+	// High per-minute limit so the 429 is caused exclusively by burst exhaustion, not rate.
+	const limitPerMin = 6000
+	const burst = 2
+	lim := NewUserRateLimiter(limitPerMin, burst)
+	r := newRLTestEngine(t, lim.Handler())
+
+	const subject = "user-uuid-burst-test"
+
+	// First two requests must pass (burst=2 allows 2 tokens).
+	assert.Equal(t, http.StatusOK, doRequest(t, r, subject), "1st request within burst must pass")
+	assert.Equal(t, http.StatusOK, doRequest(t, r, subject), "2nd request within burst must pass")
+	// Third immediate request must be rejected (burst exhausted).
+	assert.Equal(t, http.StatusTooManyRequests, doRequest(t, r, subject),
+		"3rd immediate request must be 429 — burst=2 is exhausted")
+}
+
 // TestUserRateLimiter_FallbackToIPWhenNoClaimsNoPanic proves the belt-and-suspenders
 // path: when no claims are present in context (e.g. middleware mis-wiring), the limiter
 // falls back to a key derived from the client IP and does NOT panic.
 func TestUserRateLimiter_FallbackToIPWhenNoClaimsNoPanic(t *testing.T) {
-	lim := NewUserRateLimiter(60)
+	lim := NewUserRateLimiter(60, 30)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -193,8 +214,9 @@ func TestUserRateLimiter_FallbackToIPWhenNoClaimsNoPanic(t *testing.T) {
 // TestUserRateLimiter_FallbackBucketExhaustedReturns429 proves that even the fallback
 // IP-keyed path is fail-closed (not a bypass).
 func TestUserRateLimiter_FallbackBucketExhaustedReturns429(t *testing.T) {
-	const limitPerMin = fallbackBurst
-	lim := NewUserRateLimiter(limitPerMin)
+	const burst = 10
+	const limitPerMin = burst
+	lim := NewUserRateLimiter(limitPerMin, burst)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -202,7 +224,7 @@ func TestUserRateLimiter_FallbackBucketExhaustedReturns429(t *testing.T) {
 	r.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	var got429 bool
-	for range fallbackBurst + 5 {
+	for range burst + 5 {
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/ping", http.NoBody)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -270,7 +292,7 @@ func TestUserKey_EmptySubjectFallsBackToIP(t *testing.T) {
 // This guards against a future regression where both limiters share state.
 func TestUserRateLimiter_IndependentFromIPRateLimiter(t *testing.T) {
 	ipRL := NewIPRateLimiter(1)
-	userRL := NewUserRateLimiter(60)
+	userRL := NewUserRateLimiter(60, 30)
 
 	// Exhaust ipRL bucket for a specific key.
 	ipKey := "rl:ip:192.0.2.1"
@@ -288,13 +310,14 @@ func TestUserRateLimiter_IndependentFromIPRateLimiter(t *testing.T) {
 // token bucket eventually refills. It uses a very high rate to make the test fast.
 func TestUserRateLimiter_BucketRefillsOverTime(t *testing.T) {
 	// 600 requests per minute = 10 per second.  After exhausting burst (10),
-	// waiting 1 second should allow at least one new token.
+	// waiting ~150ms should allow at least one new token (10/s → 1 token per 100ms).
+	const burst = 10
 	const limitPerMin = 600
-	lim := NewUserRateLimiter(limitPerMin)
+	lim := NewUserRateLimiter(limitPerMin, burst)
 	const subject = "rl:user:refill-test"
 
 	// Exhaust the burst.
-	for range fallbackBurst {
+	for range burst {
 		lim.allow(subject)
 	}
 	assert.False(t, lim.allow(subject), "bucket must be empty after exhausting burst")
