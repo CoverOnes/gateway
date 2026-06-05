@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -91,12 +92,88 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 	return &Registry{proxies: proxies}, nil
 }
 
+// upstreamPath returns the normalized path that will be forwarded to the upstream
+// for the given public request path and service name.
+// It mirrors the Rewrite logic used by the ReverseProxy: strip the /api/<svc> prefix.
+// The returned path is already percent-decoded and cleaned (no ".." segments, no "//").
+func upstreamPath(requestPath, svc string) string {
+	// Strip /api/<svc> prefix.
+	stripped := strings.TrimPrefix(requestPath, "/api/"+svc)
+	if stripped == "" {
+		stripped = "/"
+	}
+
+	// Percent-decode the path so that %2f → / and %2e%2e → .. are visible before
+	// the path-traversal check.  url.PathUnescape is the correct decoder here:
+	// it replaces every %XX sequence with its byte value but does not error on
+	// plain slashes (unlike url.QueryUnescape which treats '+' as a space).
+	decoded, err := url.PathUnescape(stripped)
+	if err != nil {
+		// Malformed percent-encoding: treat as the raw (potentially still
+		// percent-encoded) path so that path.Clean can normalise it.
+		decoded = stripped
+	}
+
+	// path.Clean resolves "." and ".." segments, collapses "//" into "/", and
+	// ensures the result starts with "/".
+	return path.Clean(decoded)
+}
+
+// containsInternalSegment reports whether the normalized upstream path would
+// route to an /internal/ endpoint — i.e. any path segment in the cleaned path
+// equals "internal" (case-insensitively).
+//
+// The comparison is case-insensitive on purpose: the guard's correctness must
+// not depend on upstream routing being case-sensitive. A future upstream using
+// a case-insensitive framework (Spring, Express with case-insensitive routing,
+// etc.) would otherwise be reachable via /Internal/ or /INTERNAL/.
+//
+// Examples that return true:
+//
+//	/internal/v1/kyc/abc/status
+//	/v1/foo/internal/bar
+//	/Internal/v1/status  and  /INTERNAL/v1/status   (case-insensitive)
+//	result of /api/kyc/foo/../internal/status (resolves to /internal/status)
+//	result of /api/kyc/%2finternal/v1   (decoded to /internal/v1)
+func containsInternalSegment(cleanedPath string) bool {
+	// Split on "/" and check each segment.
+	// path.Clean guarantees no leading "//" and no trailing "/" (unless root),
+	// so splitting is safe.
+	for _, seg := range strings.Split(cleanedPath, "/") {
+		if strings.EqualFold(seg, "internal") {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Forward proxies the request to the named upstream service.
 // Returns false and writes a 404 response if the service is not in the allowlist.
+//
+// Defense-in-depth: if the resolved upstream path contains an /internal/ segment
+// (after percent-decoding and path-cleaning), the request is refused with 404 so
+// that S2S-only endpoints are never reachable through the public gateway regardless
+// of how the upstream routes them.
 func (r *Registry) Forward(c *gin.Context, svc string) {
 	rp, ok := r.proxies[svc]
 	if !ok {
 		httpx.ErrCode(c, http.StatusNotFound, "SERVICE_NOT_FOUND", "service not found in allowlist")
+
+		return
+	}
+
+	// Block any path whose normalized upstream path contains an "internal" segment.
+	// Return 404 (not 403) to avoid revealing that the endpoint exists.
+	normalized := upstreamPath(c.Request.URL.Path, svc)
+	if containsInternalSegment(normalized) {
+		slog.Warn(
+			"proxy: blocked request targeting internal path",
+			"svc", svc,
+			"raw_path", c.Request.URL.Path,
+			"normalized_path", normalized,
+		)
+		httpx.ErrCode(c, http.StatusNotFound, "NOT_FOUND", "not found")
 
 		return
 	}
