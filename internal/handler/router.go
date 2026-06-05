@@ -120,6 +120,18 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	authGroup.POST("/resend-verification", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
+	// OAuth social-login (Google OIDC + LINE v2.1) — browser-redirect GET routes.
+	// These ARE the auth flow: the user has no access token yet, so they stay public
+	// (NoCache + IP-keyed authRL only, no Auth middleware). The :provider slug
+	// (google/line) and validation live entirely in the user upstream; the gateway is
+	// a dumb proxy here and holds NO OAuth config. /start issues a 302 to the provider;
+	// the provider redirects the browser back to /callback (gateway-fronted).
+	authGroup.GET("/oauth/:provider/start", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+	authGroup.GET("/oauth/:provider/callback", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
 
 	// Per-user rate limiter: keyed on JWT subject (user UUID).
 	// Placed AFTER Auth (which validates the JWT and injects claims) so the key is always
