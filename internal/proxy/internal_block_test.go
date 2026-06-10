@@ -112,6 +112,46 @@ func TestUpstreamPath(t *testing.T) {
 			want:        "",
 			wantValid:   false,
 		},
+		// M1-RESIDUAL — Double-encoded control sequences.
+		// %2500 PathUnescape → "%00" (literal 3-char string, not NUL byte), so the
+		// raw NUL-byte guard passes. A second-decode upstream would then route to
+		// /internal/*.  The decoded-form check must catch these.
+		{
+			name:        "double-encoded null byte %2500 before internal is invalid",
+			requestPath: "/api/kyc/%2500internal/v1",
+			svc:         "kyc",
+			want:        "",
+			wantValid:   false,
+		},
+		{
+			name:        "double-encoded null byte %2500 after segment name is invalid",
+			requestPath: "/api/kyc/internal%2500/v1",
+			svc:         "kyc",
+			want:        "",
+			wantValid:   false,
+		},
+		{
+			name:        "double-encoded CRLF %250d is invalid",
+			requestPath: "/api/kyc/internal%250d/v1",
+			svc:         "kyc",
+			want:        "",
+			wantValid:   false,
+		},
+		{
+			name:        "double-encoded newline %250a is invalid",
+			requestPath: "/api/kyc/internal%250a/v1",
+			svc:         "kyc",
+			want:        "",
+			wantValid:   false,
+		},
+		// Uppercase hex variant — containsDoubleEncodedControls must be case-insensitive.
+		{
+			name:        "double-encoded null byte %2500 uppercase hex is invalid",
+			requestPath: "/api/kyc/%2500INTERNAL/v1",
+			svc:         "kyc",
+			want:        "",
+			wantValid:   false,
+		},
 	}
 
 	for _, tc := range tests {

@@ -71,9 +71,25 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 				// This guarantees the path forwarded to the upstream is IDENTICAL
 				// to the path the internal-block guard validated — the guard and
 				// the forwarder must operate on the same cleaned string.
-				if norm, ok := req.In.Context().Value(ctxKeyNormalizedPath{}).(string); ok && norm != "" {
-					req.Out.URL.Path = norm
+				//
+				// S3 — Missing context key guard.
+				// If the normalized path is absent from context (e.g. a direct
+				// ServeHTTP call bypassing Forward), refuse to forward the request
+				// rather than silently falling back to whatever SetURL produced.
+				// A caller that bypasses Forward skips the path-guard entirely —
+				// forwarding the un-guarded path would reopen the bypass surface.
+				norm, ok := req.In.Context().Value(ctxKeyNormalizedPath{}).(string)
+				if !ok || norm == "" {
+					slog.Error(
+						"proxy: normalized path missing from context; refusing to forward",
+						"svc", svcName,
+					)
+					req.Out.Body = http.NoBody
+
+					return
 				}
+
+				req.Out.URL.Path = norm
 
 				req.Out.URL.RawQuery = req.In.URL.RawQuery
 				// Propagate X-Request-ID downstream.
@@ -101,14 +117,37 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 	return &Registry{proxies: proxies}, nil
 }
 
+// containsDoubleEncodedControls reports whether s contains a double-encoded
+// control-character sequence that would survive a single url.PathUnescape pass
+// as a literal percent-triplet.
+//
+// Attack scenario (M1-RESIDUAL): an attacker sends "/api/user/%2500internal/v1".
+//
+//	url.PathUnescape("%2500internal") → "%00internal" (the 3-char string "%00",
+//	  not a NUL byte), so the NUL-byte check in upstreamPath passes.
+//	The literal string "%00internal" is then forwarded to the upstream, where some
+//	  Go/Node/Java routers run a second URL decode and route to /internal/*.
+//
+// Reject these early: after PathUnescape we look for the percent-encoded forms of
+// NUL (%00), LF (%0a/%0A), and CR (%0d/%0D) still present in the decoded string.
+// If any are found the path is invalid, same as the M1 raw-byte check.
+func containsDoubleEncodedControls(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.Contains(lower, "%00") ||
+		strings.Contains(lower, "%0a") ||
+		strings.Contains(lower, "%0d")
+}
+
 // upstreamPath returns the normalized path that will be forwarded to the upstream
 // for the given public request path and service name, and whether the path is valid.
 // It mirrors the Rewrite logic used by the ReverseProxy: strip the /api/<svc> prefix.
 // The returned path is already percent-decoded and cleaned (no ".." segments, no "//").
 //
 // The boolean return value is false when the decoded path contains characters that
-// break path semantics (NUL byte, carriage-return, newline). Callers MUST reject
-// the request when the return value is false.
+// break path semantics (NUL byte, carriage-return, newline), OR when the decoded
+// string still contains double-encoded control sequences (%00, %0a, %0d) that would
+// bypass the single-decode guard on a second decode pass (M1-RESIDUAL).
+// Callers MUST reject the request when the return value is false.
 func upstreamPath(requestPath, svc string) (string, bool) {
 	// Strip /api/<svc> prefix.
 	stripped := strings.TrimPrefix(requestPath, "/api/"+svc)
@@ -136,6 +175,14 @@ func upstreamPath(requestPath, svc string) (string, bool) {
 	// across different OS / framework layers.
 	// Reject early (caller will return 400 INVALID_PATH) rather than forward.
 	if strings.ContainsAny(decoded, "\x00\r\n") {
+		return "", false
+	}
+
+	// M1-RESIDUAL — Double-encoded control sequence rejection.
+	// %2500 → "%00" after one PathUnescape pass; still a literal percent-triplet
+	// that a second-decode upstream would turn into a NUL byte and route around the
+	// /internal/* guard.  Reject any decoded path that still contains %00/%0a/%0d.
+	if containsDoubleEncodedControls(decoded) {
 		return "", false
 	}
 

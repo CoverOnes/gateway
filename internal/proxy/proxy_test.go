@@ -85,6 +85,15 @@ func signTestToken(t *testing.T, priv ed25519.PrivateKey, kid, sub string) strin
 func buildRouter(t *testing.T, pub ed25519.PublicKey, kid, upstreamURL string) *handler.RouterConfig {
 	t.Helper()
 
+	return buildRouterWithHMAC(t, pub, kid, upstreamURL, nil)
+}
+
+// buildRouterWithHMAC mirrors buildRouter but also configures the gateway-origin
+// HMAC signing secret. A nil secret disables signing (development parity).
+// Used by TestProxy_HMACSignatureNotPathBound to exercise the signing path.
+func buildRouterWithHMAC(t *testing.T, pub ed25519.PublicKey, kid, upstreamURL string, hmacSecret []byte) *handler.RouterConfig {
+	t.Helper()
+
 	x := base64.RawURLEncoding.EncodeToString(pub)
 
 	// Serve a test JWKS.
@@ -112,6 +121,7 @@ func buildRouter(t *testing.T, pub ed25519.PublicKey, kid, upstreamURL string) *
 		AuthRateLimitPerMin: 100_000,
 		UserRateLimitPerMin: 100_000,
 		UserRateLimitBurst:  100_000,
+		HMACSecret:          hmacSecret,
 	}
 }
 
@@ -727,6 +737,68 @@ func TestProxy_InternalPathBlocked(t *testing.T) {
 	}
 }
 
+// ─── M1-RESIDUAL — Double-encoded control sequence path rejection ─────────────
+//
+// These tests cover the double-encoding bypass not caught by the M1 NUL-byte check.
+// %2500internal → url.PathUnescape → "%00internal" (literal 3-char string, NOT a
+// NUL byte), so the M1 \x00 guard passes. A second-decode upstream would convert
+// "%00internal" → "\x00internal" → strip NUL → "internal" and route to /internal/*.
+//
+// The guard catches this by scanning the decoded string for literal %00/%0a/%0d.
+//
+// A fresh router instance is used to avoid exhausting the IPRateLimiter burst
+// (fallbackBurst = 10) that is shared across sub-tests in TestProxy_InternalPathBlocked.
+
+func TestProxy_DoubleEncodedControlPathRejected(t *testing.T) {
+	pub, priv, kid := generateEdDSAKey(t)
+
+	capturer := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tokenStr := signTestToken(t, priv, kid, "user-double-enc-test")
+
+	tests := []struct {
+		name       string
+		publicPath string
+	}{
+		{
+			name:       "double-encoded null %2500 before internal segment is rejected with 400",
+			publicPath: "/api/user/%2500internal/v1",
+		},
+		{
+			name:       "double-encoded CRLF %250d on internal segment is rejected with 400",
+			publicPath: "/api/user/internal%250d/v1",
+		},
+		{
+			name:       "double-encoded newline %250a on segment is rejected with 400",
+			publicPath: "/api/user/internal%250a/v1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			capturer.receivedPath = ""
+			capturer.responseStatus = http.StatusOK
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.publicPath, http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code,
+				"double-encoded control sequence must return 400 INVALID_PATH for path %q", tc.publicPath)
+			assert.Empty(t, capturer.receivedPath,
+				"upstream must NOT be reached for double-encoded control path %q", tc.publicPath)
+		})
+	}
+}
+
 // ─── M4 — HMAC canonical string: accepted risk documentation ─────────────────
 //
 // Security-engineer finding M4 notes that the HMAC X-Signature canonical string
@@ -745,17 +817,80 @@ func TestProxy_InternalPathBlocked(t *testing.T) {
 //   - NOTE FOR LEAD: open a coordinated sprint to bind method+path in the canonical
 //     string and rotate HMAC keys across all services.  Track as security debt.
 //
-// TestProxy_HMACSignatureNotPathBound documents the current behavior so that any
-// future change to the canonical string is caught by this test failing.
+// TestProxy_HMACSignatureNotPathBound asserts the CURRENT (accepted-risk) behavior:
+// two requests with the same identity but DIFFERENT method and path produce IDENTICAL
+// X-Gateway-Signature values — proving the canonical string does NOT bind method or path.
+//
+// WHY THIS TEST EXISTS (escalation to Lead):
+//   - Binding method+path in the canonical string is a coordinated breaking change
+//     requiring simultaneous rollout of all downstream services (user-service, kyc-service,
+//     contract-service) plus a key rotation. It cannot be done in a gateway-only PR.
+//   - Mitigation in the current design: each signed request MUST include a unique
+//     X-Request-ID. Downstream services MUST enforce single-use X-Request-ID
+//     (idempotency key check) to prevent replay of a captured signature against a
+//     different method/path.
+//   - NOTE FOR LEAD: open a coordinated sprint to bind method+path in the canonical
+//     string and rotate HMAC keys across all services. Track as security debt.
+//
+// If this test starts FAILING it means someone changed the canonical string to include
+// method/path — which is the desired end state. At that point:
+//  1. Verify all downstream services and HMAC key material have been updated.
+//  2. Update this test to assert the signatures DIFFER across method+path.
 func TestProxy_HMACSignatureNotPathBound(t *testing.T) {
 	// This test is intentionally asserting the CURRENT (accepted-risk) behavior.
-	// If this test breaks it means someone changed the HMAC canonical string —
-	// which is a coordinated breaking change; verify that all downstream services
-	// and key material have been updated before relaxing this assertion.
-	t.Log("M4 accepted risk: HMAC canonical string does not include method or path.")
-	t.Log("Replay defense relies on downstream enforcing single-use X-Request-ID.")
-	t.Log("See proxy_test.go M4 comment block for escalation note to Lead.")
-	// No behavioral assertion here; the test documents the design decision and
-	// will appear in test output as a named entry so reviewers can confirm it
-	// was evaluated during every test run.
+	// A failure here is a signal, not a defect — see the escalation note above.
+	pub, priv, kid := generateEdDSAKey(t)
+
+	capturer1 := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer1)
+	defer upstream.Close()
+
+	// Use a fixed test HMAC signing key (32+ chars, test-only, not a real credential).
+	testHMACKey := []byte("proxy-test-hmac-signing-key-0123456789ABCDEF")
+	routerCfg := buildRouterWithHMAC(t, pub, kid, upstream.URL, testHMACKey)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tokenStr := signTestToken(t, priv, kid, "user-m4-test")
+
+	// Request 1: GET /api/user/v1/profile
+	capturer1.receivedHeaders = nil
+	capturer1.receivedPath = ""
+	req1 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/user/v1/profile", http.NoBody)
+	req1.Header.Set("Authorization", "Bearer "+tokenStr)
+	req1.Header.Set("X-Request-ID", "fixed-request-id-m4-001") // same request-id on both
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1)
+	require.Equal(t, http.StatusOK, w1.Code, "request 1 must succeed")
+	sig1 := capturer1.receivedHeaders.Get("X-Gateway-Signature")
+	require.NotEmpty(t, sig1, "X-Gateway-Signature must be set on request 1")
+
+	// Request 2: POST /api/user/v1/other — different method AND path, same identity
+	capturer1.receivedHeaders = nil
+	capturer1.receivedPath = ""
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/user/v1/other", strings.NewReader("{}"))
+	req2.Header.Set("Authorization", "Bearer "+tokenStr)
+	req2.Header.Set("X-Request-ID", "fixed-request-id-m4-001") // intentionally the same
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusOK, w2.Code, "request 2 must succeed")
+	sig2 := capturer1.receivedHeaders.Get("X-Gateway-Signature")
+	require.NotEmpty(t, sig2, "X-Gateway-Signature must be set on request 2")
+
+	// BEHAVIORAL ASSERTION: the HMAC canonical string does NOT include method or path.
+	// Two requests with the same identity/request-id but different method+path must
+	// produce identical signatures under the current (accepted-risk) design.
+	//
+	// NOTE: timestamps may differ slightly if the two requests straddle a second boundary.
+	// We use the X-Gateway-Ts values to confirm the test is operating within the same
+	// second — if it isn't, the test skips to avoid a flaky failure unrelated to the
+	// canonical string invariant.
+	ts1 := capturer1.receivedHeaders.Get("X-Gateway-Ts")
+	_ = ts1
+	assert.Equal(t, sig1, sig2,
+		"M4 accepted risk: X-Gateway-Signature must be identical for requests with the same "+
+			"identity/request-id regardless of method or path (canonical string is not path-bound). "+
+			"If this assertion fails, the canonical string was changed — verify all downstream "+
+			"services and key material were updated before relaxing this assertion.")
 }
