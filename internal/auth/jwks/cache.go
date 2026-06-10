@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -34,15 +35,43 @@ type Cache struct {
 	client  *http.Client
 }
 
+// noRedirectAcrossHosts is a CheckRedirect function that allows redirects within the
+// same host (scheme+host) but rejects any redirect that changes the target host.
+// This prevents a compromised or misconfigured JWKS endpoint from redirecting the
+// gateway to a cloud-metadata service or other SSRF-forbidden destination.
+func noRedirectAcrossHosts(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+
+	original, err := url.Parse(via[0].URL.String())
+	if err != nil {
+		return fmt.Errorf("jwks redirect rejected: cannot parse original URL: %w", err)
+	}
+
+	if req.URL.Host != original.Host {
+		return fmt.Errorf("jwks redirect rejected: cross-host redirect from %q to %q is not allowed",
+			original.Host, req.URL.Host)
+	}
+
+	return nil
+}
+
 // NewCache creates a JWKS cache and performs the initial fetch.
 // A warning is emitted for transient fetch failures; the gateway will start with an
 // empty cache and report not_ready until a successful fetch.
+//
+// The underlying HTTP client rejects cross-host redirects to prevent SSRF via a
+// compromised/misconfigured JWKS endpoint that issues a 302 to a metadata service.
 func NewCache(jwksURL string, ttl, fetchTimeout time.Duration) *Cache {
 	c := &Cache{
 		keys:    make(map[string]ed25519.PublicKey),
 		jwksURL: jwksURL,
 		ttl:     ttl,
-		client:  &http.Client{Timeout: fetchTimeout},
+		client: &http.Client{
+			Timeout:       fetchTimeout,
+			CheckRedirect: noRedirectAcrossHosts,
+		},
 	}
 	c.inflightCond = sync.NewCond(&c.inflightMu)
 

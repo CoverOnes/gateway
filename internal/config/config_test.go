@@ -269,3 +269,56 @@ func TestLoad_StagingWithoutHMACSecretFails(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "GATEWAY_HMAC_SECRET")
 }
+
+// ─── JWKS URL SSRF validation tests (Major finding 5) ─────────────────────────
+
+// TestLoad_JWKSURLLinkLocalRejected asserts that a link-local / cloud-metadata IP
+// in USER_JWKS_URL is rejected at boot to prevent SSRF via the JWKS fetcher.
+func TestLoad_JWKSURLLinkLocalRejected(t *testing.T) {
+	minValidEnv(t)
+	// 169.254.169.254 is the AWS/GCP metadata endpoint — always forbidden.
+	setEnv(t, "USER_JWKS_URL", "http://169.254.169.254/jwks")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_JWKS_URL")
+}
+
+// TestLoad_JWKSURLLoopbackRejectedInProd asserts that a loopback address in
+// USER_JWKS_URL is rejected in production (allowed in development).
+func TestLoad_JWKSURLLoopbackRejectedInProd(t *testing.T) {
+	minValidEnv(t)
+	setEnv(
+		t,
+		"GATEWAY_ENV", "production",
+		"GATEWAY_HMAC_SECRET", validProdSecret,
+		"USER_JWKS_URL", "http://127.0.0.1:8080/jwks",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_JWKS_URL")
+}
+
+// TestLoad_JWKSURLLoopbackAllowedInDev asserts that loopback is allowed in
+// development (so local integration tests can run without modifying /etc/hosts).
+func TestLoad_JWKSURLLoopbackAllowedInDev(t *testing.T) {
+	minValidEnv(t)
+	// GATEWAY_ENV=development already set by minValidEnv.
+	setEnv(t, "USER_JWKS_URL", "http://127.0.0.1:8080/jwks")
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "http://127.0.0.1:8080/jwks", cfg.JWKSUserURL)
+}
+
+// TestLoad_JWKSURLUnsupportedSchemeRejected asserts that non-http/https schemes
+// in USER_JWKS_URL are rejected (e.g. file:// or ftp://).
+func TestLoad_JWKSURLUnsupportedSchemeRejected(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "USER_JWKS_URL", "file:///etc/passwd")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_JWKS_URL")
+}

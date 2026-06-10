@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -154,6 +155,8 @@ func (c *Config) validate() error {
 
 	if c.JWKSUserURL == "" {
 		errs = append(errs, "USER_JWKS_URL is required")
+	} else {
+		errs = append(errs, c.validateJWKSURL()...)
 	}
 
 	if c.UserUpstreamURL == "" {
@@ -221,6 +224,42 @@ func (c *Config) validateHMACSecret() []string {
 	}
 
 	return nil
+}
+
+// validateJWKSURL checks that USER_JWKS_URL has an http/https scheme and is not an
+// SSRF-dangerous IP literal. This mirrors the same check applied to proxy upstream URLs
+// in ParseRouteTable so the JWKS fetcher and the proxy have symmetric SSRF posture.
+func (c *Config) validateJWKSURL() []string {
+	parsed, err := parseSchemeAndHost(c.JWKSUserURL)
+	if err != nil {
+		return []string{fmt.Sprintf("USER_JWKS_URL is invalid: %s", err)}
+	}
+
+	// SSRF guard: same forbidden-range check as proxy upstreams, using non-dev = isProduction.
+	if err := checkSSRF(parsed, !c.IsDev()); err != nil {
+		return []string{fmt.Sprintf("USER_JWKS_URL SSRF guard: %s", err)}
+	}
+
+	return nil
+}
+
+// parseSchemeAndHost parses rawURL and validates it has an http/https scheme and non-empty host.
+func parseSchemeAndHost(rawURL string) (*url.URL, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q (only http/https allowed)", parsed.Scheme)
+	}
+
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("empty host")
+	}
+
+	return parsed, nil
 }
 
 // IsDev reports whether the service is running in development mode.

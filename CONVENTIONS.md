@@ -158,9 +158,14 @@ CORS (preflight must be handled first)
 ## 10. Auth Middleware & KYC Tier Gate
 
 - Bearer JWT verified offline using local JWKS cache (from user service `/jwks`, `max-age=300s`).
-- `RequireTier(n)` middleware returns `403 KYC_TIER_REQUIRED {requiredTier, currentTier}` when `token.kycTier < n`.
-- Each protected route declares `min_tier` explicitly in the router (deny-by-default per spec §7.3).
 - `WithValidMethods(["EdDSA"])` — reject `alg=none` and any HS*/RS* algorithms.
+- **KYC tier gating is NOT enforced at the gateway layer.** The gateway forwards all
+  valid-token requests regardless of `kycTier` value. Every downstream service MUST
+  enforce its own per-endpoint tier requirement by reading `X-Kyc-Tier` from the
+  gateway-signed identity tuple (verified via `X-Gateway-Signature`, see §24/§24.1).
+  A downstream author MUST NOT assume the gateway has pre-filtered by tier.
+- The `KYC_TIER_REQUIRED` (403) error code is emitted only by downstream services, not
+  by the gateway itself.
 
 ---
 
@@ -275,3 +280,55 @@ Copy the small platform layer (`httpx`, `logger`, `middleware`, `health`) into e
 - Reuse detection: `used_at IS NOT NULL` on presented token → revoke whole family → 401.
 - Expiry: `expires_at = issued + 24h`.
 - Retention: scheduled `DELETE WHERE expires_at < now() - interval '7 days'` (forensic grace window).
+
+---
+
+## 24. Gateway-Origin HMAC Signature Contract
+
+The gateway HMAC-signs the injected identity tuple so downstream services can prove the
+identity headers originated from the gateway. This is defense-in-depth layered on top of
+the gateway-sole-JWT-verifier model — it is NOT a replacement for JWT verification.
+
+### 24.1 Canonical String and Replay Semantics
+
+**Canonical string** (decision 2d8284a6 — immutable; coordinate both sides before any change):
+
+```
+X-User-Id|X-Kyc-Tier|X-Account-Type|X-Email-Verified|X-Request-ID|X-Gateway-Ts
+```
+
+Joined by `|` in exactly that order with no escaping. Empty field → empty string between the
+adjacent `|` separators. The gateway uses HMAC-SHA256 with the shared secret
+`GATEWAY_HMAC_SECRET` (each downstream service configures the same value as
+`<SVC>_GATEWAY_HMAC_SECRET`).
+
+**Headers emitted by the gateway:**
+
+| Header | Format | Example |
+|--------|--------|---------|
+| `X-Gateway-Ts` | Unix epoch seconds as decimal string | `1717632000` |
+| `X-Gateway-Signature` | lowercase hex-encoded HMAC-SHA256 | `a3f2...` |
+| `X-Email-Verified` | exactly `"true"` or `"false"` | `"true"` |
+
+**Downstream MUST enforce all of the following:**
+
+1. **Timestamp freshness**: reject any request where `|now_unix − X-Gateway-Ts| > 30` seconds.
+   Use the gateway's `X-Gateway-Ts` value, not the current clock, when verifying the signature
+   so that the skew check and the signed value stay in sync.
+
+2. **X-Request-ID as single-use correlation**: the gateway binds one signature to one
+   `X-Request-ID`. Downstreams that require strict anti-replay MUST cache consumed
+   `(X-Request-ID, X-Gateway-Ts)` pairs in Redis with TTL = 30 s and reject duplicates.
+   Downstreams that accept replay risk within the 30 s window MUST document this explicitly.
+
+3. **Exact `X-Email-Verified` match**: the gateway emits the Go literal `strconv.FormatBool`
+   output — always exactly `"true"` or `"false"`. Downstream MUST compare with an exact
+   case-sensitive string match. Never coerce to JSON bool, `"1"`, `"True"`, or empty string.
+
+4. **Signature verification before trusting any identity header**: if `GATEWAY_HMAC_SECRET`
+   is configured, the downstream MUST verify `X-Gateway-Signature` over the canonical string
+   before accepting `X-User-Id`, `X-Kyc-Tier`, `X-Account-Type`, or `X-Email-Verified`.
+
+**Development environments**: `GATEWAY_HMAC_SECRET` may be empty; the gateway then omits
+`X-Gateway-Ts` and `X-Gateway-Signature`. Downstreams SHOULD skip verification when the
+configured secret is empty (consistent with the gateway's own dev-only posture).
