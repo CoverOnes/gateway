@@ -67,10 +67,15 @@ func ParseRouteTable(cfg *Config) (RouteTable, error) {
 // are blocked in ALL environments. Loopback (127.0.0.0/8, ::1/128) is blocked in
 // production only (allowed in development so local integration tests can run).
 var (
-	// Always-forbidden ranges (link-local / cloud metadata).
+	// Always-forbidden ranges (link-local / cloud metadata / any-address).
 	alwaysForbidden = []netip.Prefix{
 		netip.MustParsePrefix("169.254.0.0/16"), // IPv4 link-local incl. 169.254.169.254
 		netip.MustParsePrefix("fe80::/10"),      // IPv6 link-local
+		// M3 — SSRF any-address: 0.0.0.0 and :: bind to all interfaces; an upstream
+		// pointing there would reach whatever service happens to listen on the port,
+		// identical in risk to the loopback SSRF class.  Block in all environments.
+		netip.MustParsePrefix("0.0.0.0/32"), // IPv4 any-address (INADDR_ANY)
+		netip.MustParsePrefix("::/128"),     // IPv6 any-address (IN6ADDR_ANY)
 	}
 
 	// Loopback ranges — forbidden in production, allowed in development.

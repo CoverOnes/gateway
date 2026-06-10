@@ -102,10 +102,14 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 }
 
 // upstreamPath returns the normalized path that will be forwarded to the upstream
-// for the given public request path and service name.
+// for the given public request path and service name, and whether the path is valid.
 // It mirrors the Rewrite logic used by the ReverseProxy: strip the /api/<svc> prefix.
 // The returned path is already percent-decoded and cleaned (no ".." segments, no "//").
-func upstreamPath(requestPath, svc string) string {
+//
+// The boolean return value is false when the decoded path contains characters that
+// break path semantics (NUL byte, carriage-return, newline). Callers MUST reject
+// the request when the return value is false.
+func upstreamPath(requestPath, svc string) (string, bool) {
 	// Strip /api/<svc> prefix.
 	stripped := strings.TrimPrefix(requestPath, "/api/"+svc)
 	if stripped == "" {
@@ -123,9 +127,21 @@ func upstreamPath(requestPath, svc string) string {
 		decoded = stripped
 	}
 
+	// M1 — Null-byte / CRLF rejection.
+	// url.PathUnescape decodes %00 → \x00. A path containing a NUL byte tricks
+	// containsInternalSegment: strings.Split("\x00internal", "/") produces the
+	// segment "\x00internal", and EqualFold("\x00internal","internal") is false,
+	// so the guard passes and the request reaches the upstream which may strip the
+	// NUL and route to /internal/*.  Similarly, \r or \n break path semantics
+	// across different OS / framework layers.
+	// Reject early (caller will return 400 INVALID_PATH) rather than forward.
+	if strings.ContainsAny(decoded, "\x00\r\n") {
+		return "", false
+	}
+
 	// path.Clean resolves "." and ".." segments, collapses "//" into "/", and
 	// ensures the result starts with "/".
-	return path.Clean(decoded)
+	return path.Clean(decoded), true
 }
 
 // containsInternalSegment reports whether the normalized upstream path would
@@ -149,7 +165,14 @@ func containsInternalSegment(cleanedPath string) bool {
 	// path.Clean guarantees no leading "//" and no trailing "/" (unless root),
 	// so splitting is safe.
 	for _, seg := range strings.Split(cleanedPath, "/") {
-		if strings.EqualFold(seg, "internal") {
+		// M2 — Trailing-dot bypass.
+		// path.Clean("/internal./x") keeps "internal." verbatim; some upstreams
+		// (e.g. IIS, Tomcat, nginx on Windows) strip trailing dots and route
+		// "internal." to the /internal/* handler.  Strip all trailing dots before
+		// the case-insensitive comparison so "internal.", "internal..", etc. are
+		// treated identically to "internal".
+		normalised := strings.TrimRight(seg, ".")
+		if strings.EqualFold(normalised, "internal") {
 			return true
 		}
 	}
@@ -178,7 +201,20 @@ func (r *Registry) Forward(c *gin.Context, svc string) {
 
 	// Compute the normalized upstream path once. This is the canonical form
 	// that both the guard below and Rewrite above must agree on.
-	normalized := upstreamPath(c.Request.URL.Path, svc)
+	//
+	// upstreamPath also validates that the decoded path does not contain
+	// characters that break path semantics (NUL, CR, LF — see M1 fix).
+	normalized, valid := upstreamPath(c.Request.URL.Path, svc)
+	if !valid {
+		slog.Warn(
+			"proxy: rejected request with invalid path characters (NUL/CR/LF)",
+			"svc", svc,
+			"raw_path", c.Request.URL.Path,
+		)
+		httpx.ErrCode(c, http.StatusBadRequest, "INVALID_PATH", "invalid path")
+
+		return
+	}
 
 	// Block any path whose normalized upstream path contains an "internal" segment.
 	// Return 404 (not 403) to avoid revealing that the endpoint exists.

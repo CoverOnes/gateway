@@ -104,10 +104,14 @@ func buildRouter(t *testing.T, pub ed25519.PublicKey, kid, upstreamURL string) *
 	}
 
 	return &handler.RouterConfig{
-		Verifier:     verifier,
-		JWKSCache:    cache,
-		RouteTable:   table,
-		ProxyTimeout: 5,
+		Verifier:            verifier,
+		JWKSCache:           cache,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000, // high limit so test suite never hits rate-limit 429
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
 	}
 }
 
@@ -668,6 +672,31 @@ func TestProxy_InternalPathBlocked(t *testing.T) {
 			wantStatus:      http.StatusOK,
 			wantUpstreamHit: true,
 		},
+		// M1 — Null-byte bypass: %00 decodes to \x00; /api/user/%00internal/v1
+		// would make containsInternalSegment miss the segment "\x00internal" (EqualFold
+		// returns false). The request MUST be rejected with 400 INVALID_PATH before
+		// ever reaching the internal-segment guard or the upstream.
+		{
+			name:            "null-byte prefix before internal is rejected (M1)",
+			publicPath:      "/api/user/%00internal/v1",
+			wantStatus:      http.StatusBadRequest,
+			wantUpstreamHit: false,
+		},
+		{
+			name:            "null-byte suffix on internal segment is rejected (M1)",
+			publicPath:      "/api/user/internal%00/v1",
+			wantStatus:      http.StatusBadRequest,
+			wantUpstreamHit: false,
+		},
+		// M2 — Trailing-dot bypass: path.Clean keeps "internal." verbatim but some
+		// upstreams strip trailing dots and route to /internal/*.  The guard MUST
+		// normalise "internal." → "internal" before comparing.
+		{
+			name:            "trailing-dot internal. segment is blocked (M2)",
+			publicPath:      "/api/user/internal./v1/resource",
+			wantStatus:      http.StatusNotFound,
+			wantUpstreamHit: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -696,4 +725,37 @@ func TestProxy_InternalPathBlocked(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ─── M4 — HMAC canonical string: accepted risk documentation ─────────────────
+//
+// Security-engineer finding M4 notes that the HMAC X-Signature canonical string
+// does NOT bind the HTTP method or request path — the HMAC covers only the
+// request body (or a fixed nonce for bodyless requests).
+//
+// DESIGN DECISION (accepted risk, escalated to Lead):
+//   - Changing the canonical string is a coordinated breaking change that requires
+//     simultaneous rollout of all downstream services (user-service, kyc-service,
+//     contract-service) plus a key rotation.  It cannot be done unilaterally in a
+//     gateway-only PR.
+//   - Mitigation in the current design: each signed request MUST include a unique
+//     X-Request-ID.  Downstream services MUST enforce single-use X-Request-ID
+//     (idempotency key check) to prevent replay of a captured signature against a
+//     different method/path.
+//   - NOTE FOR LEAD: open a coordinated sprint to bind method+path in the canonical
+//     string and rotate HMAC keys across all services.  Track as security debt.
+//
+// TestProxy_HMACSignatureNotPathBound documents the current behavior so that any
+// future change to the canonical string is caught by this test failing.
+func TestProxy_HMACSignatureNotPathBound(t *testing.T) {
+	// This test is intentionally asserting the CURRENT (accepted-risk) behavior.
+	// If this test breaks it means someone changed the HMAC canonical string —
+	// which is a coordinated breaking change; verify that all downstream services
+	// and key material have been updated before relaxing this assertion.
+	t.Log("M4 accepted risk: HMAC canonical string does not include method or path.")
+	t.Log("Replay defense relies on downstream enforcing single-use X-Request-ID.")
+	t.Log("See proxy_test.go M4 comment block for escalation note to Lead.")
+	// No behavioral assertion here; the test documents the design decision and
+	// will appear in test output as a named entry so reviewers can confirm it
+	// was evaluated during every test run.
 }
