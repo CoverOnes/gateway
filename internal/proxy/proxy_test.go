@@ -19,6 +19,7 @@ import (
 	"github.com/CoverOnes/gateway/internal/config"
 	"github.com/CoverOnes/gateway/internal/handler"
 	"github.com/CoverOnes/gateway/internal/platform/health"
+	"github.com/CoverOnes/gateway/internal/proxy"
 )
 
 // upstreamCapturer is a test upstream that records what it receives.
@@ -797,6 +798,56 @@ func TestProxy_DoubleEncodedControlPathRejected(t *testing.T) {
 				"upstream must NOT be reached for double-encoded control path %q", tc.publicPath)
 		})
 	}
+}
+
+// ─── S3 — Missing normalized-path context key: upstream must NOT be reached ───
+//
+// This test verifies that the S3 guard in the Rewrite closure is not merely a
+// cosmetic log+body-truncation: when the normalized-path context key is absent
+// (as in a direct ServeHTTP call that bypasses Forward), the upstream is
+// verifiably never contacted.
+//
+// Before this fix: req.Out.Body = http.NoBody alone did NOT abort the upstream
+// dial — httputil.ReverseProxy still sent a request (with an empty body) to the
+// upstream URL set by req.SetURL.
+//
+// After this fix: the Rewrite closure also sets req.Out.URL.Host = "" so the
+// transport dial fails immediately (no host to connect to).  The ErrorHandler
+// returns 502 BAD_GATEWAY.  The upstream capturer is never hit.
+func TestProxy_MissingNormalizedPath_DoesNotReachUpstream(t *testing.T) {
+	capturer := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer)
+	defer upstream.Close()
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream.URL},
+	}
+
+	// Build a Registry directly — bypasses the full Gin/Auth stack.
+	registry, err := proxy.New(table, 5)
+	require.NoError(t, err)
+
+	rp, ok := registry.ProxyForService("user")
+	require.True(t, ok, "user service must be registered")
+
+	// Craft a request WITHOUT the ctxKeyNormalizedPath value in its context.
+	// This simulates a caller that drives the proxy's ServeHTTP directly,
+	// bypassing Forward (which is the only code path that stashes the key).
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/me", http.NoBody)
+	// Deliberately do NOT set ctxKeyNormalizedPath in req's context.
+
+	w := httptest.NewRecorder()
+	rp.ServeHTTP(w, req)
+
+	// The upstream must NOT have been contacted.
+	assert.Empty(t, capturer.receivedPath,
+		"upstream must NOT be reached when normalized-path context key is absent")
+
+	// The response must be non-2xx (ErrorHandler fires and returns 502).
+	assert.NotEqual(t, http.StatusOK, w.Code,
+		"response must not be 200 OK when normalized-path context key is absent")
+	assert.Equal(t, http.StatusBadGateway, w.Code,
+		"missing context key must produce 502 BAD_GATEWAY via ErrorHandler")
 }
 
 // ─── M4 — HMAC canonical string: accepted risk documentation ─────────────────

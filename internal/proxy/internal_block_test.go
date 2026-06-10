@@ -144,10 +144,27 @@ func TestUpstreamPath(t *testing.T) {
 			want:        "",
 			wantValid:   false,
 		},
-		// Uppercase hex variant — containsDoubleEncodedControls must be case-insensitive.
+		// Uppercase hex variant — must be case-insensitive.
 		{
 			name:        "double-encoded null byte %2500 uppercase hex is invalid",
 			requestPath: "/api/kyc/%2500INTERNAL/v1",
+			svc:         "kyc",
+			want:        "",
+			wantValid:   false,
+		},
+		// N-level encoding — triple and quad encoding must also be rejected.
+		// With a single PathUnescape pass, %252500 → %2500 (still encoded), so
+		// the guard missed it.  The idempotent decode loop decodes all layers.
+		{
+			name:        "triple-encoded null byte %252500 before internal is invalid",
+			requestPath: "/api/kyc/%252500internal/v1",
+			svc:         "kyc",
+			want:        "",
+			wantValid:   false,
+		},
+		{
+			name:        "quad-encoded null byte %25252500 before internal is invalid",
+			requestPath: "/api/kyc/%25252500internal/v1",
 			svc:         "kyc",
 			want:        "",
 			wantValid:   false,

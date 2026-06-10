@@ -31,6 +31,12 @@ type plainResponseWriter struct {
 // the same cleaned path — fixing the CONVENTIONS §10 path-confusion finding.
 type ctxKeyNormalizedPath struct{}
 
+// sentinelNoForward is the host value set on req.Out.URL when the Rewrite
+// closure detects a missing/empty normalized-path context key (S3 guard).
+// Setting Host to "" causes the transport to fail the dial immediately, so
+// the upstream server is never contacted — the ErrorHandler returns 502.
+const sentinelNoForward = ""
+
 // Registry maps service name to a pre-built ReverseProxy instance.
 // Only services in the allowlist are proxied; unknown services get 404.
 type Registry struct {
@@ -78,12 +84,19 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 				// rather than silently falling back to whatever SetURL produced.
 				// A caller that bypasses Forward skips the path-guard entirely —
 				// forwarding the un-guarded path would reopen the bypass surface.
+				//
+				// To verifiably prevent upstream contact, set req.Out.URL.Host to
+				// the empty string so the transport dial fails closed.  The proxy
+				// ErrorHandler returns 502 BAD_GATEWAY, which is the correct
+				// behavior: something went wrong in the gateway, not in the upstream.
 				norm, ok := req.In.Context().Value(ctxKeyNormalizedPath{}).(string)
 				if !ok || norm == "" {
 					slog.Error(
 						"proxy: normalized path missing from context; refusing to forward",
 						"svc", svcName,
+						"raw_path", req.In.URL.Path,
 					)
+					req.Out.URL.Host = sentinelNoForward
 					req.Out.Body = http.NoBody
 
 					return
@@ -117,25 +130,36 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 	return &Registry{proxies: proxies}, nil
 }
 
-// containsDoubleEncodedControls reports whether s contains a double-encoded
-// control-character sequence that would survive a single url.PathUnescape pass
-// as a literal percent-triplet.
+// decodePathFully performs an idempotent URL-path decode loop: it repeatedly
+// calls url.PathUnescape until the result is stable (unchanged) or an error
+// occurs, then returns the fully-decoded string.
 //
-// Attack scenario (M1-RESIDUAL): an attacker sends "/api/user/%2500internal/v1".
+// Why idempotent loop: a single url.PathUnescape pass leaves n-level encoded
+// sequences only partially decoded.  Example:
 //
-//	url.PathUnescape("%2500internal") → "%00internal" (the 3-char string "%00",
-//	  not a NUL byte), so the NUL-byte check in upstreamPath passes.
-//	The literal string "%00internal" is then forwarded to the upstream, where some
-//	  Go/Node/Java routers run a second URL decode and route to /internal/*.
+//	%252500internal
+//	  → pass 1: %2500internal  (% was decoded, leaving %2500)
+//	  → pass 2: %00internal    (still a literal %00 triplet)
+//	  → pass 3: \x00internal   (NUL byte — now caught by raw-byte check)
 //
-// Reject these early: after PathUnescape we look for the percent-encoded forms of
-// NUL (%00), LF (%0a/%0A), and CR (%0d/%0D) still present in the decoded string.
-// If any are found the path is invalid, same as the M1 raw-byte check.
-func containsDoubleEncodedControls(s string) bool {
-	lower := strings.ToLower(s)
-	return strings.Contains(lower, "%00") ||
-		strings.Contains(lower, "%0a") ||
-		strings.Contains(lower, "%0d")
+// After the loop the result is the maximally-decoded form of the input.  Any
+// control character (\x00, \r, \n) that survives to this form is a raw byte
+// and is caught by the ContainsAny guard that follows.  No n-level encoding
+// can smuggle a control character past a fully-decoded form.
+//
+// The loop is bounded because url.PathUnescape strictly shrinks the string on
+// every successful pass (every %XX triplet it consumes shortens the string by
+// at least one byte); once no %XX sequence remains the output equals the input
+// and the loop terminates.
+func decodePathFully(s string) string {
+	for {
+		next, err := url.PathUnescape(s)
+		if err != nil || next == s {
+			return s
+		}
+
+		s = next
+	}
 }
 
 // upstreamPath returns the normalized path that will be forwarded to the upstream
@@ -143,10 +167,11 @@ func containsDoubleEncodedControls(s string) bool {
 // It mirrors the Rewrite logic used by the ReverseProxy: strip the /api/<svc> prefix.
 // The returned path is already percent-decoded and cleaned (no ".." segments, no "//").
 //
-// The boolean return value is false when the decoded path contains characters that
-// break path semantics (NUL byte, carriage-return, newline), OR when the decoded
-// string still contains double-encoded control sequences (%00, %0a, %0d) that would
-// bypass the single-decode guard on a second decode pass (M1-RESIDUAL).
+// The boolean return value is false when the fully-decoded path contains characters
+// that break path semantics (NUL byte, carriage-return, newline).  The idempotent
+// decode loop (decodePathFully) ensures that n-level encoded control characters
+// (%252500, %25252500, …) are fully unwrapped before the byte check — closing ALL
+// n-level encoding bypass variants including triple and quad encoding.
 // Callers MUST reject the request when the return value is false.
 func upstreamPath(requestPath, svc string) (string, bool) {
 	// Strip /api/<svc> prefix.
@@ -155,34 +180,17 @@ func upstreamPath(requestPath, svc string) (string, bool) {
 		stripped = "/"
 	}
 
-	// Percent-decode the path so that %2f → / and %2e%2e → .. are visible before
-	// the path-traversal check.  url.PathUnescape is the correct decoder here:
-	// it replaces every %XX sequence with its byte value but does not error on
-	// plain slashes (unlike url.QueryUnescape which treats '+' as a space).
-	decoded, err := url.PathUnescape(stripped)
-	if err != nil {
-		// Malformed percent-encoding: treat as the raw (potentially still
-		// percent-encoded) path so that path.Clean can normalise it.
-		decoded = stripped
-	}
+	// Idempotent decode loop: repeatedly url.PathUnescape until stable.
+	// This collapses all layers of percent-encoding (%2500, %252500, …) into
+	// their final decoded byte values before any guard runs.
+	decoded := decodePathFully(stripped)
 
 	// M1 — Null-byte / CRLF rejection.
-	// url.PathUnescape decodes %00 → \x00. A path containing a NUL byte tricks
-	// containsInternalSegment: strings.Split("\x00internal", "/") produces the
-	// segment "\x00internal", and EqualFold("\x00internal","internal") is false,
-	// so the guard passes and the request reaches the upstream which may strip the
-	// NUL and route to /internal/*.  Similarly, \r or \n break path semantics
-	// across different OS / framework layers.
+	// After full decode, any \x00, \r, or \n is present as a raw byte.
 	// Reject early (caller will return 400 INVALID_PATH) rather than forward.
+	// This check now covers ALL n-level encoding variants: triple (%252500),
+	// quad (%25252500), etc. — because decodePathFully unwraps them all.
 	if strings.ContainsAny(decoded, "\x00\r\n") {
-		return "", false
-	}
-
-	// M1-RESIDUAL — Double-encoded control sequence rejection.
-	// %2500 → "%00" after one PathUnescape pass; still a literal percent-triplet
-	// that a second-decode upstream would turn into a NUL byte and route around the
-	// /internal/* guard.  Reject any decoded path that still contains %00/%0a/%0d.
-	if containsDoubleEncodedControls(decoded) {
 		return "", false
 	}
 
