@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -322,6 +323,269 @@ func TestProxy_ReadyzReflectsJWKSCacheState(t *testing.T) {
 
 	// Cache was populated in buildRouter, so /readyz should be 200.
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// ─── Deny-by-default auth tests (Critical finding) ────────────────────────────
+//
+// These tests prove that the auth middleware wiring at router.go:154
+// (api.Use(authMW)) actually turns a bad/missing token into a 401 and that the
+// upstream is never reached. Without these tests an accidental deletion of
+// api.Use(authMW) would ship green.
+
+// TestProxy_ProtectedRoute_DeniesInvalidAuth is a table-driven test asserting that
+// every /api/:svc/* request with an invalid or missing token gets:
+//   - HTTP 401
+//   - body containing "UNAUTHORIZED"
+//   - upstream NOT reached
+func TestProxy_ProtectedRoute_DeniesInvalidAuth(t *testing.T) {
+	pub, priv, kid := generateEdDSAKey(t)
+
+	capturer := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	now := time.Now().UTC()
+
+	// Build a token signed with a different key (tampered signature from the router's perspective).
+	_, differentPriv, differentKid := generateEdDSAKey(t)
+	wrongKeyToken := signTestToken(t, differentPriv, differentKid, "user-abc")
+
+	// Build an expired token.
+	expiredToken := mintToken(t, priv, kid, now.Add(-20*time.Minute), now.Add(-10*time.Minute))
+
+	// Build a wrong-issuer token.
+	wrongIssuerToken := mintTokenWithIssuer(t, priv, kid, "evil-issuer", now)
+
+	// Build a tampered token: take a valid token and corrupt its signature segment.
+	validToken := signTestToken(t, priv, kid, "user-abc")
+	tamperedToken := tamperSignature(validToken)
+
+	tests := []struct {
+		name          string
+		authorization string // full Authorization header value, or "" for no header
+	}{
+		{
+			name:          "no Authorization header → 401",
+			authorization: "",
+		},
+		{
+			name:          "wrong scheme (Basic) → 401",
+			authorization: "Basic dXNlcjpwYXNz",
+		},
+		{
+			name:          "empty Bearer value → 401",
+			authorization: "Bearer ",
+		},
+		{
+			name:          "expired token → 401",
+			authorization: "Bearer " + expiredToken,
+		},
+		{
+			name:          "wrong issuer → 401",
+			authorization: "Bearer " + wrongIssuerToken,
+		},
+		{
+			name:          "tampered signature → 401",
+			authorization: "Bearer " + tamperedToken,
+		},
+		{
+			name:          "unknown kid → 401",
+			authorization: "Bearer " + wrongKeyToken,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reset capturer between sub-tests.
+			capturer.receivedPath = ""
+			capturer.receivedHeaders = nil
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/user/v1/me", http.NoBody)
+			if tc.authorization != "" {
+				req.Header.Set("Authorization", tc.authorization)
+			}
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusUnauthorized, w.Code,
+				"protected route must return 401 for %q", tc.name)
+			assert.Contains(t, w.Body.String(), "UNAUTHORIZED",
+				"body must contain UNAUTHORIZED for %q", tc.name)
+			assert.Empty(t, capturer.receivedPath,
+				"upstream must NOT be reached for %q", tc.name)
+		})
+	}
+}
+
+// TestProxy_Logout_DeniesInvalidAuth verifies that /v1/auth/logout also requires
+// a valid token and returns 401 without reaching the upstream on bad auth.
+func TestProxy_Logout_DeniesInvalidAuth(t *testing.T) {
+	pub, _, kid := generateEdDSAKey(t)
+
+	capturer := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		authorization string
+	}{
+		{"no token", ""},
+		{"garbage token", "Bearer not.a.jwt"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			capturer.receivedPath = ""
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/auth/logout", http.NoBody)
+			if tc.authorization != "" {
+				req.Header.Set("Authorization", tc.authorization)
+			}
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusUnauthorized, w.Code,
+				"/v1/auth/logout must return 401 without valid token: %q", tc.name)
+			assert.Contains(t, w.Body.String(), "UNAUTHORIZED")
+			assert.Empty(t, capturer.receivedPath,
+				"upstream must NOT be reached for logout without valid token: %q", tc.name)
+		})
+	}
+}
+
+// mintToken creates a token with explicit iat and exp timestamps.
+func mintToken(t *testing.T, priv ed25519.PrivateKey, kid string, iat, exp time.Time) string {
+	t.Helper()
+
+	claims := &jwt.Claims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			Issuer:    jwt.Issuer,
+			Subject:   "user-abc",
+			Audience:  gojwt.ClaimStrings{jwt.Audience},
+			IssuedAt:  gojwt.NewNumericDate(iat),
+			ExpiresAt: gojwt.NewNumericDate(exp),
+		},
+		KYCTier:     1,
+		AccountType: "PERSONAL",
+	}
+
+	token := gojwt.NewWithClaims(gojwt.SigningMethodEdDSA, claims)
+	token.Header["kid"] = kid
+
+	signed, err := token.SignedString(priv)
+	require.NoError(t, err)
+
+	return signed
+}
+
+// mintTokenWithIssuer creates a token with a custom issuer.
+func mintTokenWithIssuer(t *testing.T, priv ed25519.PrivateKey, kid, issuer string, now time.Time) string {
+	t.Helper()
+
+	claims := &jwt.Claims{
+		RegisteredClaims: gojwt.RegisteredClaims{
+			Issuer:    issuer,
+			Subject:   "user-abc",
+			Audience:  gojwt.ClaimStrings{jwt.Audience},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(10 * time.Minute)),
+		},
+		KYCTier:     1,
+		AccountType: "PERSONAL",
+	}
+
+	token := gojwt.NewWithClaims(gojwt.SigningMethodEdDSA, claims)
+	token.Header["kid"] = kid
+
+	signed, err := token.SignedString(priv)
+	require.NoError(t, err)
+
+	return signed
+}
+
+// tamperSignature replaces the signature segment of a JWT with zeroed bytes.
+func tamperSignature(tokenStr string) string {
+	parts := strings.SplitN(tokenStr, ".", 3)
+	if len(parts) != 3 {
+		return tokenStr
+	}
+	// 64 bytes → 86 base64url chars (no padding).
+	return parts[0] + "." + parts[1] + "." + strings.Repeat("A", 86)
+}
+
+// ─── Path normalization tests (Major finding 2) ────────────────────────────────
+//
+// These tests prove that the path forwarded to the upstream is the SAME cleaned path
+// the internal-block guard validated. Before the fix, /api/user/v1/foo/../bar forwarded
+// the literal "/v1/foo/../bar" with ".." unresolved; now it must forward "/v1/bar".
+
+func TestProxy_PathNormalization(t *testing.T) {
+	pub, priv, kid := generateEdDSAKey(t)
+
+	capturer := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tokenStr := signTestToken(t, priv, kid, "user-abc")
+
+	tests := []struct {
+		name         string
+		publicPath   string
+		expectedPath string // what the upstream should see
+	}{
+		{
+			name:         "dot-dot traversal is cleaned before forwarding",
+			publicPath:   "/api/user/v1/foo/../bar",
+			expectedPath: "/v1/bar",
+		},
+		{
+			name:         "double slash is collapsed before forwarding",
+			publicPath:   "/api/user/v1//me",
+			expectedPath: "/v1/me",
+		},
+		{
+			name:         "clean path is forwarded as-is",
+			publicPath:   "/api/user/v1/me",
+			expectedPath: "/v1/me",
+		},
+		{
+			name:         "nested dot-dot is fully resolved",
+			publicPath:   "/api/user/v1/a/b/../../c",
+			expectedPath: "/v1/c",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			capturer.receivedPath = ""
+			capturer.responseStatus = http.StatusOK
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tc.publicPath, http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, tc.expectedPath, capturer.receivedPath,
+				"upstream path mismatch for %q", tc.publicPath)
+		})
+	}
 }
 
 // ─── Internal-path blocking tests ─────────────────────────────────────────────

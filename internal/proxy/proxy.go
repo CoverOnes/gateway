@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +24,12 @@ import (
 type plainResponseWriter struct {
 	http.ResponseWriter
 }
+
+// ctxKeyNormalizedPath is the context key used to pass the pre-computed,
+// normalized upstream path from Forward (where the guard runs) to Rewrite
+// (where the path is forwarded). This ensures guard and forwarder operate on
+// the same cleaned path — fixing the CONVENTIONS §10 path-confusion finding.
+type ctxKeyNormalizedPath struct{}
 
 // Registry maps service name to a pre-built ReverseProxy instance.
 // Only services in the allowlist are proxied; unknown services get 404.
@@ -60,10 +67,12 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 		rp := &httputil.ReverseProxy{
 			Rewrite: func(req *httputil.ProxyRequest) {
 				req.SetURL(baseURL)
-				// Strip the /api/<svc> prefix from the path, leaving only the downstream path.
-				req.Out.URL.Path = strings.TrimPrefix(req.In.URL.Path, "/api/"+svcName)
-				if req.Out.URL.Path == "" {
-					req.Out.URL.Path = "/"
+				// Use the pre-computed normalized path stashed by Forward.
+				// This guarantees the path forwarded to the upstream is IDENTICAL
+				// to the path the internal-block guard validated — the guard and
+				// the forwarder must operate on the same cleaned string.
+				if norm, ok := req.In.Context().Value(ctxKeyNormalizedPath{}).(string); ok && norm != "" {
+					req.Out.URL.Path = norm
 				}
 
 				req.Out.URL.RawQuery = req.In.URL.RawQuery
@@ -155,6 +164,10 @@ func containsInternalSegment(cleanedPath string) bool {
 // (after percent-decoding and path-cleaning), the request is refused with 404 so
 // that S2S-only endpoints are never reachable through the public gateway regardless
 // of how the upstream routes them.
+//
+// Path normalization: the normalized (cleaned) upstream path is stashed in the
+// request context so that Rewrite forwards the SAME path the guard validated —
+// preventing guard-bypass via dot-dot/double-slash/percent-encoding divergence.
 func (r *Registry) Forward(c *gin.Context, svc string) {
 	rp, ok := r.proxies[svc]
 	if !ok {
@@ -163,9 +176,12 @@ func (r *Registry) Forward(c *gin.Context, svc string) {
 		return
 	}
 
+	// Compute the normalized upstream path once. This is the canonical form
+	// that both the guard below and Rewrite above must agree on.
+	normalized := upstreamPath(c.Request.URL.Path, svc)
+
 	// Block any path whose normalized upstream path contains an "internal" segment.
 	// Return 404 (not 403) to avoid revealing that the endpoint exists.
-	normalized := upstreamPath(c.Request.URL.Path, svc)
 	if containsInternalSegment(normalized) {
 		slog.Warn(
 			"proxy: blocked request targeting internal path",
@@ -177,6 +193,13 @@ func (r *Registry) Forward(c *gin.Context, svc string) {
 
 		return
 	}
+
+	// Stash the normalized path in the request context so Rewrite picks it up.
+	// This closes the guard-vs-forwarder split: Rewrite uses the cleaned path
+	// the guard just validated rather than re-stripping the raw (un-cleaned) path.
+	c.Request = c.Request.WithContext(
+		context.WithValue(c.Request.Context(), ctxKeyNormalizedPath{}, normalized),
+	)
 
 	// Wrap c.Writer in plainResponseWriter to prevent httputil.ReverseProxy from
 	// type-asserting to http.CloseNotifier (gin's responseWriter panics when the
