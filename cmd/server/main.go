@@ -92,12 +92,18 @@ func run() error {
 		return fmt.Errorf("build router: %w", err)
 	}
 
+	// WriteTimeout must exceed the proxy's ResponseHeaderTimeout so that a slow-but-valid
+	// upstream response can fully stream to the client before the server-side write
+	// deadline fires.  A buffer of 10 s is sufficient: if the upstream hasn't started
+	// sending headers within ProxyTimeoutSec the transport already aborted the dial.
+	writeTimeout := time.Duration(cfg.ProxyTimeoutSec)*time.Second + 10*time.Second
+
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second, // mitigate slow-loris header attacks
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 

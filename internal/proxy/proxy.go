@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -71,6 +72,20 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 		baseURL := targetURL
 
 		rp := &httputil.ReverseProxy{
+			// ModifyResponse enforces the gateway's security-header policy on every
+			// upstream response. A compromised or misconfigured upstream that omits
+			// or overrides these headers would otherwise be able to weaken the
+			// client-side security posture. Re-setting them here ensures the gateway
+			// always controls the final values regardless of what the upstream sends.
+			ModifyResponse: func(resp *http.Response) error {
+				resp.Header.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+				resp.Header.Set("X-Content-Type-Options", "nosniff")
+				resp.Header.Set("X-Frame-Options", "DENY")
+				resp.Header.Set("Referrer-Policy", "no-referrer")
+				resp.Header.Set("Content-Security-Policy", "default-src 'none'")
+
+				return nil
+			},
 			Rewrite: func(req *httputil.ProxyRequest) {
 				req.SetURL(baseURL)
 				// Use the pre-computed normalized path stashed by Forward.
@@ -111,6 +126,19 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 			Transport:     transport,
 			FlushInterval: -1, // streaming support
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				// Detect request-body-too-large: http.MaxBytesReader fires this error
+				// when the client sends a body that exceeds the gateway's limit.
+				// Return 413 REQUEST_ENTITY_TOO_LARGE instead of 502 so the client
+				// receives an actionable error code rather than a generic gateway error.
+				var mbe *http.MaxBytesError
+				if errors.As(err, &mbe) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusRequestEntityTooLarge)
+					_, _ = w.Write([]byte(`{"error":{"code":"REQUEST_ENTITY_TOO_LARGE","message":"request body exceeds maximum allowed size"}}`))
+
+					return
+				}
+
 				// Log the real error server-side ONLY; return generic envelope to client.
 				slog.Error(
 					"proxy upstream error",
@@ -220,6 +248,14 @@ func containsInternalSegment(cleanedPath string) bool {
 	// path.Clean guarantees no leading "//" and no trailing "/" (unless root),
 	// so splitting is safe.
 	for _, seg := range strings.Split(cleanedPath, "/") {
+		// M3 — Semicolon matrix-parameter bypass.
+		// RFC 3986 §3.3 allows ";" in path segments as a path parameter delimiter
+		// (matrix URIs). Some frameworks (Spring Matrix Variables, WebSphere) strip
+		// the ";params" suffix before routing, so "/internal;foo" is routed the same
+		// as "/internal". Strip everything from the first ";" before comparing so
+		// "/internal;version=1" cannot bypass the guard.
+		seg, _, _ = strings.Cut(seg, ";")
+
 		// M2 — Trailing-dot bypass.
 		// path.Clean("/internal./x") keeps "internal." verbatim; some upstreams
 		// (e.g. IIS, Tomcat, nginx on Windows) strip trailing dots and route

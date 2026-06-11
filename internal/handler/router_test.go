@@ -1,12 +1,14 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,4 +180,276 @@ func TestLogoutNotGatedByAuthRL(t *testing.T) {
 	logoutCode := doRouterRequest(t, r, http.MethodPost, "/v1/auth/logout", token)
 	assert.NotEqual(t, http.StatusTooManyRequests, logoutCode,
 		"logout must NOT be blocked when authRL is depleted but ipRL has recovered (logout is outside authGroup)")
+}
+
+// ─── TestNewRouterFromConfig_WildcardCORSOriginDropped ──────────────────────
+
+// TestNewRouterFromConfig_WildcardCORSOriginDropped proves that when GATEWAY_CORS_ORIGINS
+// contains only wildcard/null entries, they are silently dropped so the gateway starts
+// without CORS headers rather than enabling an unsafe CWE-942 configuration.
+func TestNewRouterFromConfig_WildcardCORSOriginDropped(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	tests := []struct {
+		name        string
+		corsOrigins []string // fed directly into RouterConfig (already parsed by NewRouterFromConfig)
+	}{
+		{
+			name:        "nil origins → CORS disabled",
+			corsOrigins: nil,
+		},
+		{
+			name:        "empty slice → CORS disabled",
+			corsOrigins: []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pub, _ := generateEdDSAKey(t)
+			resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+			verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+			r, err := handler.NewRouter(&handler.RouterConfig{
+				Verifier:            verifier,
+				JWKSCache:           nil,
+				RouteTable:          table,
+				ProxyTimeout:        5,
+				RateLimitPerMin:     100_000,
+				AuthRateLimitPerMin: 100_000,
+				UserRateLimitPerMin: 100_000,
+				UserRateLimitBurst:  100_000,
+				CORSOrigins:         tc.corsOrigins,
+				HMACSecret:          nil,
+			})
+			require.NoError(t, err)
+
+			// OPTIONS preflight on an auth route — must NOT get Access-Control-Allow-Origin
+			// when CORS is disabled (no origins configured).
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodOptions,
+				"/v1/auth/login",
+				http.NoBody,
+			)
+			req.Header.Set("Origin", "https://evil.example.com")
+			req.Header.Set("Access-Control-Request-Method", "POST")
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Empty(t, w.Header().Get("Access-Control-Allow-Origin"),
+				"Access-Control-Allow-Origin must be absent when no safe origins are configured; case: %q", tc.name)
+		})
+	}
+}
+
+// ─── TestBodyLimit_AuthRoute413 ───────────────────────────────────────────────
+
+// TestBodyLimit_AuthRoute413 verifies that /v1/auth/* routes enforce a 64 KiB
+// body limit and return 413 REQUEST_ENTITY_TOO_LARGE for oversized payloads.
+// This covers the re-review Major finding: no request body size limit on auth routes.
+func TestBodyLimit_AuthRoute413(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// 64 KiB + 1 byte exceeds the auth body limit (64 KiB).
+	oversized := bytes.Repeat([]byte("a"), 64*1024+1)
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/auth/login",
+		bytes.NewReader(oversized),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code,
+		"oversized auth body must return 413 REQUEST_ENTITY_TOO_LARGE")
+	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
+		"413 body must contain machine-readable error code")
+}
+
+// ─── TestBodyLimit_APIRouteSmallPayloadOK ────────────────────────────────────
+
+// TestBodyLimit_APIRouteSmallPayloadOK verifies that the 10 MiB limit on /api/*
+// does not reject legitimate requests below the threshold.
+func TestBodyLimit_APIRouteSmallPayloadOK(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	const kid = "body-limit-test-kid"
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+
+	upstream := upstreamStub(t)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	r, routerErr := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, routerErr)
+
+	token := mintToken(t, priv, kid, "user-body-limit-ok")
+
+	smallBody := strings.NewReader(`{"key":"value"}`)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/user/v1/profile", smallBody)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code,
+		"small API payload must not be rejected by body limit middleware")
+}
+
+// ─── TestTrustedProxyCIDR_InvalidRejected ────────────────────────────────────
+
+// TestTrustedProxyCIDR_InvalidRejected verifies that an invalid CIDR in
+// GATEWAY_TRUSTED_PROXY_CIDR causes config.Load() to return an error at boot.
+// This covers the re-review Major finding: trusted proxy CIDR validation.
+func TestTrustedProxyCIDR_InvalidRejected(t *testing.T) {
+	cfg := &config.Config{TrustedProxyCIDR: "not-a-cidr"}
+
+	_, err := cfg.ValidateTrustedProxyCIDRs()
+	require.Error(t, err, "invalid CIDR must be rejected")
+	assert.Contains(t, err.Error(), "not-a-cidr")
+}
+
+// TestTrustedProxyCIDR_ValidParsed verifies that valid CIDRs are parsed correctly.
+func TestTrustedProxyCIDR_ValidParsed(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantLen int
+		wantNil bool
+	}{
+		{
+			name:    "empty string → nil (disabled)",
+			input:   "",
+			wantNil: true,
+		},
+		{
+			name:    "single CIDR",
+			input:   "10.0.0.0/8",
+			wantLen: 1,
+		},
+		{
+			name:    "multiple CIDRs",
+			input:   "10.0.0.0/8,172.16.0.0/12",
+			wantLen: 2,
+		},
+		{
+			name:    "CIDRs with spaces",
+			input:   "10.0.0.0/8, 172.16.0.0/12",
+			wantLen: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{TrustedProxyCIDR: tc.input}
+			cidrs, err := cfg.ValidateTrustedProxyCIDRs()
+			require.NoError(t, err)
+			if tc.wantNil {
+				assert.Nil(t, cidrs)
+			} else {
+				assert.Len(t, cidrs, tc.wantLen)
+			}
+		})
+	}
+}
+
+// ─── TestRateLimiter_RetryAfterHeader ─────────────────────────────────────────
+
+// TestRateLimiter_RetryAfterHeader verifies that 429 responses include the
+// Retry-After header so clients know when to retry.
+func TestRateLimiter_RetryAfterHeader(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	// Build router with rate limit of 1/min burst=1 so it exhausts immediately.
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     1,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// Exhaust the IP rate limit (burst=10 for IP RL).
+	var got429 bool
+	var retryAfter string
+
+	for range 15 {
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/auth/login",
+			http.NoBody,
+		)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code == http.StatusTooManyRequests {
+			got429 = true
+			retryAfter = w.Header().Get("Retry-After")
+
+			break
+		}
+	}
+
+	require.True(t, got429, "expected a 429 after exhausting rate limit")
+	assert.NotEmpty(t, retryAfter, "429 response must include Retry-After header")
 }

@@ -88,8 +88,8 @@ var (
 // checkSSRF returns an error if the upstream URL host is an IP literal that falls
 // into a forbidden range. Hostnames are always allowed (internal services legitimately
 // live on private RFC-1918 ranges that are accessed via DNS).
-// isProduction should be true when GATEWAY_ENV == "production".
-func checkSSRF(parsedURL *url.URL, isProduction bool) error {
+// isNonDev should be true when GATEWAY_ENV != "development" (i.e. staging or production).
+func checkSSRF(parsedURL *url.URL, isNonDev bool) error {
 	// Extract the host without port.
 	host := parsedURL.Hostname()
 
@@ -112,11 +112,12 @@ func checkSSRF(parsedURL *url.URL, isProduction bool) error {
 		}
 	}
 
-	// In production, loopback is also forbidden.
-	if isProduction {
+	// In non-dev environments, loopback is also forbidden: staging and production must
+	// not resolve to the loopback interface (consistent with the HMAC and other non-dev gates).
+	if isNonDev {
 		for _, prefix := range loopbackRanges {
 			if prefix.Contains(addr) {
-				return fmt.Errorf("upstream host %q is in forbidden loopback range %s (not allowed in production)", host, prefix)
+				return fmt.Errorf("upstream host %q is in forbidden loopback range %s (not allowed in non-dev)", host, prefix)
 			}
 		}
 	}

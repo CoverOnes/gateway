@@ -3,6 +3,7 @@ package handler
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -14,6 +15,15 @@ import (
 	"github.com/CoverOnes/gateway/internal/proxy"
 	"github.com/gin-gonic/gin"
 )
+
+// bodyLimitAPI is the maximum request body size for /api/* proxy routes (10 MiB).
+// Upstream services can enforce tighter limits per-endpoint; this guards the gateway.
+const bodyLimitAPI = 10 << 20 // 10 MiB
+
+// bodyLimitAuth is the maximum request body size for /v1/auth/* routes (64 KiB).
+// Auth payloads (login, register, refresh tokens) are always small JSON objects; a 64 KiB
+// limit prevents body-buffering DoS on the gateway before the upstream is ever reached.
+const bodyLimitAuth = 64 << 10 // 64 KiB
 
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
@@ -29,6 +39,11 @@ type RouterConfig struct {
 	// HMACSecret signs the gateway-origin identity tuple (CONVENTIONS §24).
 	// Empty → signing disabled (development only; non-dev config fails fast).
 	HMACSecret []byte
+	// TrustedProxyCIDRs is the parsed list from GATEWAY_TRUSTED_PROXY_CIDR.
+	// When non-nil, Gin calls SetTrustedProxies with these CIDRs so that
+	// ClientIP reads the real client IP from X-Forwarded-For.
+	// nil (default) → SetTrustedProxies(nil), all proxy trust disabled.
+	TrustedProxyCIDRs []string
 }
 
 // rateLimitOrDefault returns v if > 0, otherwise fallback.
@@ -58,7 +73,20 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
-	r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+
+	// Trusted proxy configuration — determines how ClientIP resolves the real client IP.
+	// When TrustedProxyCIDRs is set (production/staging behind a LB), Gin reads the real
+	// client IP from X-Forwarded-For so that per-IP rate limiting keys on the actual client
+	// instead of the shared LB egress IP.
+	// When nil (development / unset), all proxy trust is disabled: ClientIP returns the
+	// direct connection IP — safe for direct internet-facing deployments without an LB.
+	if len(cfg.TrustedProxyCIDRs) > 0 {
+		if err := r.SetTrustedProxies(cfg.TrustedProxyCIDRs); err != nil {
+			return nil, fmt.Errorf("set trusted proxies: %w", err)
+		}
+	} else {
+		r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+	}
 
 	// CORS must be first — preflight OPTIONS must be handled before any other middleware
 	// (rate limiter, auth, etc.) can reject the request.
@@ -99,11 +127,12 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 		registry.Forward(c, "user")
 	})
 
-	// Public auth routes — no JWT, but NoCache + tighter rate limit.
+	// Public auth routes — no JWT, but NoCache + tighter rate limit + tight body limit.
 	authRL := middleware.NewAuthRateLimiter(rateLimitOrDefault(cfg.AuthRateLimitPerMin, 20))
 	authGroup := r.Group("/v1/auth")
 	authGroup.Use(middleware.NoCache())
 	authGroup.Use(authRL.Handler())
+	authGroup.Use(bodyLimitMiddleware(bodyLimitAuth))
 	authGroup.POST("/register", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
@@ -151,6 +180,7 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	// Protected proxy routes — Auth + PerUserRateLimit + InjectIdentity required.
 	// /api/:svc/* pattern with allowlist-only forwarding.
 	api := r.Group("/api/:svc")
+	api.Use(bodyLimitMiddleware(bodyLimitAPI))
 	api.Use(authMW)
 	api.Use(userRL.Handler())
 	api.Use(middleware.InjectIdentity(cfg.HMACSecret))
@@ -184,6 +214,20 @@ func accessLogger() gin.HandlerFunc {
 	}
 }
 
+// bodyLimitMiddleware returns a Gin middleware that caps the request body to maxBytes.
+// When the body exceeds the limit, http.MaxBytesReader causes the downstream proxy
+// ErrorHandler to detect a *http.MaxBytesError and return 413 REQUEST_ENTITY_TOO_LARGE.
+// This prevents body-buffering DoS on both auth and proxy routes.
+func bodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		}
+
+		c.Next()
+	}
+}
+
 // NewRouterFromConfig builds a RouterConfig from a full app config and a JWKS cache.
 // This is the entrypoint used by cmd/server/main.go.
 func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine, error) {
@@ -213,6 +257,16 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		}
 	}
 
+	// Parse trusted proxy CIDRs — validated at boot by config.Load(), safe to ignore error here.
+	trustedProxyCIDRs, err := appCfg.ValidateTrustedProxyCIDRs()
+	if err != nil {
+		return nil, fmt.Errorf("trusted proxy CIDRs: %w", err)
+	}
+
+	if len(trustedProxyCIDRs) > 0 {
+		slog.Info("trusted proxy CIDRs configured", "cidrs", trustedProxyCIDRs)
+	}
+
 	r, err := NewRouter(&RouterConfig{
 		Verifier:            verifier,
 		JWKSCache:           cache,
@@ -224,6 +278,7 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		UserRateLimitBurst:  appCfg.UserRateLimitBurst,
 		CORSOrigins:         corsOrigins,
 		HMACSecret:          []byte(appCfg.HMACSecret),
+		TrustedProxyCIDRs:   trustedProxyCIDRs,
 	})
 	if err != nil {
 		return nil, err

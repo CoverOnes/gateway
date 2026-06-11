@@ -850,6 +850,37 @@ func TestProxy_MissingNormalizedPath_DoesNotReachUpstream(t *testing.T) {
 		"missing context key must produce 502 BAD_GATEWAY via ErrorHandler")
 }
 
+// ─── Fix: protected route requires auth ──────────────────────────────────────
+
+// TestProxy_ProtectedRouteRequiresAuth verifies that GET /api/user/v1/me without
+// an Authorization header is rejected with 401 UNAUTHORIZED before the upstream
+// is contacted. This covers the re-review finding requiring an explicit test for
+// the deny-by-default auth wiring on protected proxy routes.
+func TestProxy_ProtectedRouteRequiresAuth(t *testing.T) {
+	pub, _, kid := generateEdDSAKey(t)
+
+	capturer := &upstreamCapturer{}
+	upstream := httptest.NewServer(capturer)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/user/v1/me", http.NoBody)
+	// No Authorization header set.
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code,
+		"GET /api/user/v1/me without Authorization must return 401")
+	assert.Contains(t, w.Body.String(), "UNAUTHORIZED",
+		"401 body must contain machine-readable UNAUTHORIZED code")
+	assert.Empty(t, capturer.receivedPath,
+		"upstream must NOT be reached when Authorization header is missing")
+}
+
 // ─── M4 — HMAC canonical string: accepted risk documentation ─────────────────
 //
 // Security-engineer finding M4 notes that the HMAC X-Signature canonical string
