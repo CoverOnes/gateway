@@ -159,6 +159,12 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	authGroup.GET("/oauth/:provider/callback", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
+	// POST /v1/auth/oauth/register — completes the no-email registration flow (LINE without
+	// email scope: user supplies an email). authGroup applies authRL (registration deserves
+	// rate-limiting) + NoCache + bodyLimit.
+	authGroup.POST("/oauth/register", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
 
 	// POST /v1/auth/oauth/exchange — consumes a one-time login code and returns a token pair.
 	// Intentionally outside authGroup (no authRL): the one-time code is single-use and
