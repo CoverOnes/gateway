@@ -150,6 +150,28 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 		registry.Forward(c, "user")
 	})
 
+	// OAuth social login routes (Increment 4) — public, authRL + NoCache apply via authGroup.
+	// GET  /v1/auth/oauth/:provider/start    — returns authorization URL (no auth required).
+	// GET  /v1/auth/oauth/:provider/callback — browser redirect target from provider.
+	authGroup.GET("/oauth/:provider/start", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+	authGroup.GET("/oauth/:provider/callback", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+
+	// POST /v1/auth/oauth/exchange — consumes a one-time login code and returns a token pair.
+	// Intentionally outside authGroup (no authRL): the one-time code is single-use and
+	// short-lived; it is already the rate-limiting artifact. The IP-level ipRL still applies.
+	r.POST(
+		"/v1/auth/oauth/exchange",
+		middleware.NoCache(),
+		bodyLimitMiddleware(bodyLimitAuth),
+		func(c *gin.Context) {
+			registry.Forward(c, "user")
+		},
+	)
+
 	// Per-user rate limiter: keyed on JWT subject (user UUID).
 	// Placed AFTER Auth (which validates the JWT and injects claims) so the key is always
 	// the authenticated user identity, never an attacker-supplied value.
@@ -177,6 +199,18 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 			registry.Forward(c, "user")
 		},
 	)
+
+	// Protected /v1/me proxy — Auth + PerUserRateLimit + InjectIdentity required.
+	// All routes under /v1/me (profile, sessions, OAuth bind/unbind) are forwarded to
+	// the user service. The middleware chain mirrors the /v1/me group in user/router.go.
+	me := r.Group("/v1/me")
+	me.Use(bodyLimitMiddleware(bodyLimitAPI))
+	me.Use(authMW)
+	me.Use(userRL.Handler())
+	me.Use(middleware.InjectIdentity(cfg.HMACSecret))
+	me.Any("/*proxyPath", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
 
 	// Protected proxy routes — Auth + PerUserRateLimit + InjectIdentity required.
 	// /api/:svc/* pattern with allowlist-only forwarding.
