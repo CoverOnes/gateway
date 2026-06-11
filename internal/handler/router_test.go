@@ -345,15 +345,40 @@ func TestBodyLimit_APIRouteSmallPayloadOK(t *testing.T) {
 
 // ─── TestTrustedProxyCIDR_InvalidRejected ────────────────────────────────────
 
-// TestTrustedProxyCIDR_InvalidRejected verifies that an invalid CIDR in
-// GATEWAY_TRUSTED_PROXY_CIDR causes config.Load() to return an error at boot.
-// This covers the re-review Major finding: trusted proxy CIDR validation.
+// TestTrustedProxyCIDR_InvalidRejected verifies that invalid or dangerous CIDRs in
+// GATEWAY_TRUSTED_PROXY_CIDR are rejected at boot — preventing X-Forwarded-For spoofing
+// that would bypass IP rate limiting.
 func TestTrustedProxyCIDR_InvalidRejected(t *testing.T) {
-	cfg := &config.Config{TrustedProxyCIDR: "not-a-cidr"}
+	tests := []struct {
+		name        string
+		input       string
+		errContains string
+	}{
+		{
+			name:        "non-CIDR string is rejected",
+			input:       "not-a-cidr",
+			errContains: "not-a-cidr",
+		},
+		{
+			name:        "IPv4 whole-address-space 0.0.0.0/0 is rejected",
+			input:       "0.0.0.0/0",
+			errContains: "entire address space",
+		},
+		{
+			name:        "IPv6 whole-address-space ::/0 is rejected",
+			input:       "::/0",
+			errContains: "entire address space",
+		},
+	}
 
-	_, err := cfg.ValidateTrustedProxyCIDRs()
-	require.Error(t, err, "invalid CIDR must be rejected")
-	assert.Contains(t, err.Error(), "not-a-cidr")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{TrustedProxyCIDR: tc.input}
+			_, err := cfg.ValidateTrustedProxyCIDRs()
+			require.Error(t, err, "dangerous/invalid CIDR must be rejected")
+			assert.Contains(t, err.Error(), tc.errContains)
+		})
+	}
 }
 
 // TestTrustedProxyCIDR_ValidParsed verifies that valid CIDRs are parsed correctly.
@@ -452,4 +477,62 @@ func TestRateLimiter_RetryAfterHeader(t *testing.T) {
 
 	require.True(t, got429, "expected a 429 after exhausting rate limit")
 	assert.NotEmpty(t, retryAfter, "429 response must include Retry-After header")
+}
+
+// ─── TestBodyLimit_LogoutRoute413 ────────────────────────────────────────────
+
+// TestBodyLimit_LogoutRoute413 verifies that /v1/auth/logout enforces the 64 KiB
+// body limit. Logout is registered outside authGroup (intentionally, to avoid the
+// IP-keyed authRL limiter) so the body limit must be added explicitly to its chain.
+// This covers the re-review Minor finding: logout had no body limit.
+//
+// bodyLimitMiddleware wraps the body with http.MaxBytesReader but does not read eagerly;
+// the limit fires when the proxy reads the body. authMW reads only the Authorization
+// header, so a valid JWT is required to reach the proxy and trigger the 413.
+func TestBodyLimit_LogoutRoute413(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	pub, priv := generateEdDSAKey(t)
+	const kid = "logout-limit-kid"
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// 64 KiB + 1 byte exceeds the auth body limit (64 KiB).
+	oversized := bytes.Repeat([]byte("a"), 64*1024+1)
+
+	token := mintToken(t, priv, kid, "test-logout-limit-user")
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/auth/logout",
+		bytes.NewReader(oversized),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code,
+		"oversized logout body must return 413 REQUEST_ENTITY_TOO_LARGE")
+	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
+		"413 body must contain machine-readable error code")
 }

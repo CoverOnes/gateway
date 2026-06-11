@@ -169,6 +169,7 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	r.POST(
 		"/v1/auth/logout",
 		middleware.NoCache(),
+		bodyLimitMiddleware(bodyLimitAuth),
 		authMW,
 		userRL.Handler(),
 		middleware.InjectIdentity(cfg.HMACSecret),

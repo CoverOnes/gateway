@@ -322,3 +322,80 @@ func TestLoad_JWKSURLUnsupportedSchemeRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "USER_JWKS_URL")
 }
+
+// ─── ValidateTrustedProxyCIDRs ────────────────────────────────────────────────
+
+// TestValidateTrustedProxyCIDRs covers the whole-address-space rejection guard
+// introduced in the M1 security finding: 0.0.0.0/0 and ::/0 allow any client
+// to forge X-Forwarded-For, making c.ClientIP() fully attacker-controlled and
+// bypassing IP rate limiting.
+func TestValidateTrustedProxyCIDRs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cidr    string
+		wantErr string // non-empty → expect error containing this substring
+	}{
+		{
+			name:    "happy path single IPv4 CIDR",
+			cidr:    "10.0.0.0/8",
+			wantErr: "",
+		},
+		{
+			name:    "happy path multiple CIDRs",
+			cidr:    "10.0.0.0/8,172.16.0.0/12",
+			wantErr: "",
+		},
+		{
+			name:    "happy path IPv6 non-zero prefix",
+			cidr:    "2001:db8::/32",
+			wantErr: "",
+		},
+		{
+			name:    "empty field returns nil (disabled)",
+			cidr:    "",
+			wantErr: "",
+		},
+		{
+			name:    "invalid CIDR rejected",
+			cidr:    "not-a-cidr",
+			wantErr: "GATEWAY_TRUSTED_PROXY_CIDR",
+		},
+		// M1 guard: whole-address-space CIDRs must be rejected.
+		{
+			name:    "0.0.0.0/0 rejected — entire IPv4 space",
+			cidr:    "0.0.0.0/0",
+			wantErr: "covers the entire address space",
+		},
+		{
+			name:    "::/0 rejected — entire IPv6 space",
+			cidr:    "::/0",
+			wantErr: "covers the entire address space",
+		},
+		{
+			name:    "0.0.0.0/0 in mixed list rejected",
+			cidr:    "10.0.0.0/8,0.0.0.0/0",
+			wantErr: "covers the entire address space",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &config.Config{TrustedProxyCIDR: tc.cidr}
+			cidrs, err := cfg.ValidateTrustedProxyCIDRs()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				if tc.cidr == "" {
+					assert.Nil(t, cidrs)
+				} else {
+					assert.NotEmpty(t, cidrs)
+				}
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+			}
+		})
+	}
+}

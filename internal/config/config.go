@@ -310,8 +310,16 @@ func (c *Config) ValidateTrustedProxyCIDRs() ([]string, error) {
 		}
 		// Validate by attempting to parse. net.ParseCIDR is not imported here;
 		// use net/netip.ParsePrefix for consistency with the SSRF guard.
-		if _, err := netip.ParsePrefix(s); err != nil {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
 			return nil, fmt.Errorf("GATEWAY_TRUSTED_PROXY_CIDR contains invalid CIDR %q: %w", s, err)
+		}
+
+		// Reject whole-address-space CIDRs (0.0.0.0/0, ::/0).
+		// Trusting every IP as a proxy means any client can forge X-Forwarded-For,
+		// making c.ClientIP() fully attacker-controlled and bypassing IP rate limiting.
+		if p.Bits() == 0 {
+			return nil, fmt.Errorf("GATEWAY_TRUSTED_PROXY_CIDR %q covers the entire address space; use a specific LB egress CIDR", s)
 		}
 
 		cidrs = append(cidrs, s)
