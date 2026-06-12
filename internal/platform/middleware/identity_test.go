@@ -88,7 +88,16 @@ func setupIdentityTestRouterWithSecret(
 //
 // The helpers in this test that call expectedSignature for GET /protected/resource with
 // no body must use method="GET", path="/protected/resource", body=nil.
-func expectedSignature(secret []byte, method, path string, body []byte, userID, kycTier, accountType, emailVerified, requestID, ts string) string {
+// path is always "/protected/resource" in the current test suite because that is the only
+// registered route; it is kept explicit as a parameter for readability when adding future cases.
+//
+//nolint:unparam // path is "/protected/resource" in all current call sites; parameter retained for readability
+func expectedSignature(
+	secret []byte,
+	method, path string,
+	body []byte,
+	userID, kycTier, accountType, emailVerified, requestID, ts string,
+) string {
 	bodyHashRaw := sha256.Sum256(body)
 	bodyHashHex := hex.EncodeToString(bodyHashRaw[:])
 
@@ -730,7 +739,11 @@ func TestInjectIdentity_Rev2B_MethodAndBodyBound(t *testing.T) {
 			"signer must compute HMAC over the actual POST body (rev2-B body binding)")
 
 		// Signature over a different body must NOT match.
-		wantWrongBody := expectedSignature(secret, http.MethodPost, "/protected/resource", []byte(`{"amount":9999}`), "rev2b-user", "1", "PERSONAL", "true", fixedRequestID, ts)
+		wantWrongBody := expectedSignature(
+			secret, http.MethodPost, "/protected/resource",
+			[]byte(`{"amount":9999}`),
+			"rev2b-user", "1", "PERSONAL", "true", fixedRequestID, ts,
+		)
 		assert.NotEqual(t, wantWrongBody, captured.headers.Get("X-Gateway-Signature"),
 			"signature must not match a different body (rev2-B body binding prevents body tamper)")
 	})

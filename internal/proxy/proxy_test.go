@@ -881,46 +881,21 @@ func TestProxy_ProtectedRouteRequiresAuth(t *testing.T) {
 		"upstream must NOT be reached when Authorization header is missing")
 }
 
-// ─── M4 — HMAC canonical string: accepted risk documentation ─────────────────
+// ─── M4 — HMAC canonical string: method + path + body binding (rev2-B) ──────
 //
-// Security-engineer finding M4 notes that the HMAC X-Signature canonical string
-// does NOT bind the HTTP method or request path — the HMAC covers only the
-// request body (or a fixed nonce for bodyless requests).
+// Security-engineer finding M4 noted that the old HMAC canonical string did NOT
+// bind the HTTP method or request path. That debt has been resolved in task
+// 6-12-hmac-canonical: all 8 services (gateway signer + 7 downstream verifiers)
+// now use the §24.1 rev2-B canonical string:
 //
-// DESIGN DECISION (accepted risk, escalated to Lead):
-//   - Changing the canonical string is a coordinated breaking change that requires
-//     simultaneous rollout of all downstream services (user-service, kyc-service,
-//     contract-service) plus a key rotation.  It cannot be done unilaterally in a
-//     gateway-only PR.
-//   - Mitigation in the current design: each signed request MUST include a unique
-//     X-Request-ID.  Downstream services MUST enforce single-use X-Request-ID
-//     (idempotency key check) to prevent replay of a captured signature against a
-//     different method/path.
-//   - NOTE FOR LEAD: open a coordinated sprint to bind method+path in the canonical
-//     string and rotate HMAC keys across all services.  Track as security debt.
+//	{len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n
+//	{userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
 //
-// TestProxy_HMACSignatureNotPathBound asserts the CURRENT (accepted-risk) behavior:
-// two requests with the same identity but DIFFERENT method and path produce IDENTICAL
-// X-Gateway-Signature values — proving the canonical string does NOT bind method or path.
-//
-// WHY THIS TEST EXISTS (escalation to Lead):
-//   - Binding method+path in the canonical string is a coordinated breaking change
-//     requiring simultaneous rollout of all downstream services (user-service, kyc-service,
-//     contract-service) plus a key rotation. It cannot be done in a gateway-only PR.
-//   - Mitigation in the current design: each signed request MUST include a unique
-//     X-Request-ID. Downstream services MUST enforce single-use X-Request-ID
-//     (idempotency key check) to prevent replay of a captured signature against a
-//     different method/path.
-//   - NOTE FOR LEAD: open a coordinated sprint to bind method+path in the canonical
-//     string and rotate HMAC keys across all services. Track as security debt.
-//
-// If this test starts FAILING it means someone changed the canonical string to include
-// method/path — which is the desired end state. At that point:
-//  1. Verify all downstream services and HMAC key material have been updated.
-//  2. Update this test to assert the signatures DIFFER across method+path.
-func TestProxy_HMACSignatureNotPathBound(t *testing.T) {
-	// This test is intentionally asserting the CURRENT (accepted-risk) behavior.
-	// A failure here is a signal, not a defect — see the escalation note above.
+// TestProxy_HMACSignaturePathBound asserts the NEW (correct) behavior:
+// two requests with the same identity but DIFFERENT method and path MUST produce
+// DIFFERENT X-Gateway-Signature values — proving the canonical string NOW binds method
+// and path (cross-endpoint replay prevention).
+func TestProxy_HMACSignaturePathBound(t *testing.T) {
 	pub, priv, kid := generateEdDSAKey(t)
 
 	capturer1 := &upstreamCapturer{}
@@ -960,19 +935,10 @@ func TestProxy_HMACSignatureNotPathBound(t *testing.T) {
 	sig2 := capturer1.receivedHeaders.Get("X-Gateway-Signature")
 	require.NotEmpty(t, sig2, "X-Gateway-Signature must be set on request 2")
 
-	// BEHAVIORAL ASSERTION: the HMAC canonical string does NOT include method or path.
-	// Two requests with the same identity/request-id but different method+path must
-	// produce identical signatures under the current (accepted-risk) design.
-	//
-	// NOTE: timestamps may differ slightly if the two requests straddle a second boundary.
-	// We use the X-Gateway-Ts values to confirm the test is operating within the same
-	// second — if it isn't, the test skips to avoid a flaky failure unrelated to the
-	// canonical string invariant.
-	ts1 := capturer1.receivedHeaders.Get("X-Gateway-Ts")
-	_ = ts1
-	assert.Equal(t, sig1, sig2,
-		"M4 accepted risk: X-Gateway-Signature must be identical for requests with the same "+
-			"identity/request-id regardless of method or path (canonical string is not path-bound). "+
-			"If this assertion fails, the canonical string was changed — verify all downstream "+
-			"services and key material were updated before relaxing this assertion.")
+	// rev2-B ASSERTION: the HMAC canonical string now includes method, path, and body hash.
+	// Two requests with the same identity/request-id but DIFFERENT method+path MUST
+	// produce DIFFERENT signatures — cross-endpoint replay is prevented.
+	assert.NotEqual(t, sig1, sig2,
+		"rev2-B: X-Gateway-Signature must DIFFER for requests with different method/path "+
+			"(method and path are now bound in the canonical string, closing M4 security debt)")
 }
