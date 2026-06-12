@@ -404,6 +404,69 @@ func TestInjectIdentity_NonCanonicalCaseUserIdSpoofIsStripped(t *testing.T) {
 		"non-canonical-case spoofed X-User-Id must never reach upstream")
 }
 
+// TestInjectIdentity_NonCanonicalCaseKycTierSpoofIsStripped is the X-Kyc-Tier
+// counterpart of the email-verified casing test: a non-canonical raw-map spoof
+// of the kyc tier must still be replaced by the JWT claim value.
+func TestInjectIdentity_NonCanonicalCaseKycTierSpoofIsStripped(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "noncanonical-kyctier-test-kid"
+	r, captured := setupIdentityTestRouter(t, pub, kid)
+
+	// Token with tier 0 — a spoofed raw-map high tier must not reach upstream.
+	tokenStr := generateToken(t, priv, kid, "user-kyc-nc", 0)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	// Write directly into the raw map so the key is NOT canonicalized.
+	req.Header["x-kyc-tier"] = []string{"99"} // spoofed high tier via raw map
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// Must reflect JWT claim (tier 0), never the spoofed "99".
+	assert.Equal(t, "0", captured.headers.Get("X-Kyc-Tier"),
+		"X-Kyc-Tier must come from JWT claims even when the spoof uses a non-canonical header key")
+	assert.NotContains(t, captured.headers.Values("X-Kyc-Tier"), "99",
+		"non-canonical-case spoofed X-Kyc-Tier must never reach upstream")
+}
+
+// TestInjectIdentity_NonCanonicalCaseAccountTypeSpoofIsStripped is the
+// X-Account-Type counterpart of the email-verified casing test: a non-canonical
+// raw-map spoof of the account type must still be replaced by the JWT claim value.
+func TestInjectIdentity_NonCanonicalCaseAccountTypeSpoofIsStripped(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "noncanonical-accttype-test-kid"
+	r, captured := setupIdentityTestRouter(t, pub, kid)
+
+	tokenStr := generateToken(t, priv, kid, "user-acct-nc", 1)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	// Write directly into the raw map so the key is NOT canonicalized.
+	req.Header["x-account-type"] = []string{"COMPANY"} // spoofed via raw map
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// Must reflect JWT claim ("PERSONAL"), never the spoofed "COMPANY".
+	assert.Equal(t, "PERSONAL", captured.headers.Get("X-Account-Type"),
+		"X-Account-Type must come from JWT claims even when the spoof uses a non-canonical header key")
+	assert.NotContains(t, captured.headers.Values("X-Account-Type"), "COMPANY",
+		"non-canonical-case spoofed X-Account-Type must never reach upstream")
+}
+
 func TestStripIdentityHeaders_PublicRouteDropsClientIdentity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
