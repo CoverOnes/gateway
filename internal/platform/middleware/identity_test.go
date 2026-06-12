@@ -928,6 +928,109 @@ func TestInjectIdentity_UploadRoute_EmptyBodySentinel(t *testing.T) {
 	})
 }
 
+// TestInjectIdentity_UploadRoute_SiblingPathIsNotSentinel asserts the M-1 fix:
+// sibling paths that share the "/api/file/v1/files" prefix but are NOT the exact
+// upload route (e.g. /api/file/v1/files-batch, /api/file/v1/filesx) MUST NOT be
+// treated as upload routes. The signer MUST use the real body hash (not the
+// empty-body sentinel) for these routes.
+//
+// Before the fix, isUploadRoute used a bare prefix check:
+//
+//	path[:len(prefix)] == prefix
+//
+// which matched /api/file/v1/files-batch (prefix match on "files" passes).
+// After the fix, the check requires an exact match or prefix+'/'.
+func TestInjectIdentity_UploadRoute_SiblingPathIsNotSentinel(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "sibling-upload-route-kid"
+	secret := []byte(testHMACSecret)
+
+	gin.SetMode(gin.TestMode)
+
+	resolver := &testKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	captured := &capturedRequest{}
+
+	r := gin.New()
+	r.Use(middleware.RequestID())
+
+	api := r.Group("/api/file")
+	api.Use(middleware.Auth(verifier))
+	api.Use(middleware.InjectIdentity(secret))
+	api.POST("/v1/files-batch", func(c *gin.Context) {
+		captured.headers = c.Request.Header.Clone()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	api.POST("/v1/filesx", func(c *gin.Context) {
+		captured.headers = c.Request.Header.Clone()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	tokenStr := generateToken(t, priv, kid, "sibling-user", 1)
+	const fixedRequestID = "req-sibling-0001"
+
+	siblingTests := []struct {
+		name        string
+		path        string
+		body        []byte
+		description string
+	}{
+		{
+			name:        "files-batch is NOT an upload route — real body hash used",
+			path:        "/api/file/v1/files-batch",
+			body:        []byte(`{"ids":["a","b"]}`),
+			description: "POST /api/file/v1/files-batch shares the /files prefix but is a different route",
+		},
+		{
+			name:        "filesx is NOT an upload route — real body hash used",
+			path:        "/api/file/v1/filesx",
+			body:        []byte(`{"action":"create"}`),
+			description: "POST /api/file/v1/filesx shares the /files prefix but is a different route",
+		},
+	}
+
+	for _, tc := range siblingTests {
+		t.Run(tc.name, func(t *testing.T) {
+			captured.headers = nil
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path,
+				bytes.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+			req.Header.Set("X-Request-ID", fixedRequestID)
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code)
+
+			ts := captured.headers.Get("X-Gateway-Ts")
+			require.NotEmpty(t, ts)
+
+			// Sibling route MUST use the real body hash (not the empty-body sentinel).
+			// Compute the expected signature over the real body.
+			wantRealBodySig := expectedSignature(
+				secret, http.MethodPost, tc.path,
+				tc.body,
+				"sibling-user", "1", "PERSONAL", "true", fixedRequestID, ts,
+			)
+			assert.Equal(t, wantRealBodySig, captured.headers.Get("X-Gateway-Signature"),
+				"sibling route must use real body hash (not empty-body sentinel): %s", tc.description)
+
+			// Sanity: signature over the empty-body sentinel must NOT match.
+			wantSentinelSig := expectedSignature(
+				secret, http.MethodPost, tc.path,
+				nil, // empty body → sha256("") sentinel
+				"sibling-user", "1", "PERSONAL", "true", fixedRequestID, ts,
+			)
+			assert.NotEqual(t, wantSentinelSig, captured.headers.Get("X-Gateway-Signature"),
+				"sibling route MUST NOT use the empty-body sentinel: %s", tc.description)
+		})
+	}
+}
+
 // TestInjectIdentity_UploadRoute_GoldenVector asserts the exact canonical string and
 // HMAC for the upload route using the empty-body sentinel — proving the lockstep
 // contract: the file verifier that computes the same canonical string will accept it.

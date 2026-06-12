@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CoverOnes/gateway/internal/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -55,12 +56,28 @@ type uploadRoute struct {
 }
 
 // isUploadRoute reports whether the given method + path matches an entry in the
-// upload allowlist. The path match is a prefix check so that future path params
-// (e.g. /api/file/v1/files/batch) can be added by extending uploadRoutes without
-// changing this function.
+// upload allowlist. The path match is exact OR prefix-followed-by-'/' so that
+// future sub-routes (e.g. /api/file/v1/files/batch) can be added by extending
+// uploadRoutes without changing this function.
+//
+// The guard REQUIRES a '/' separator after the prefix to prevent false-matches
+// on sibling paths such as /api/file/v1/files-batch or /api/file/v1/filesx:
+// those share the "/api/file/v1/files" prefix but are NOT upload routes and must
+// not use the empty-body sentinel.
 func isUploadRoute(method, path string) bool {
 	for _, r := range uploadRoutes {
-		if method == r.method && (path == r.pathPrefix || len(path) > len(r.pathPrefix) && path[:len(r.pathPrefix)] == r.pathPrefix) {
+		if method != r.method {
+			continue
+		}
+
+		if path == r.pathPrefix {
+			return true
+		}
+
+		// Allow sub-paths (e.g. /api/file/v1/files/123) but require '/' separator
+		// so /api/file/v1/files-batch and /api/file/v1/filesx do not match.
+		if len(path) > len(r.pathPrefix) && path[len(r.pathPrefix)] == '/' &&
+			path[:len(r.pathPrefix)] == r.pathPrefix {
 			return true
 		}
 	}
@@ -220,15 +237,17 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 				var readErr error
 
 				bodyBuf, readErr = io.ReadAll(io.LimitReader(c.Request.Body, signerBodyLimit))
-				if readErr == nil {
-					// Restore the body so the downstream proxy still receives it.
-					c.Request.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+				if readErr != nil {
+					// Body read failed — fail closed: return 502 rather than signing over
+					// sha256("") which the downstream verifier would reject as a mismatch.
+					// This is consistent with the verifier's own fail-closed posture.
+					c.AbortWithStatus(http.StatusBadGateway)
+
+					return
 				}
 
-				// On read error: leave bodyBuf nil → hash of nil = sha256("") consistent
-				// with the verifier's empty-body path. Body will be read again by proxy
-				// using the already-consumed reader — proxy handles this gracefully (sends
-				// empty body). This path is extremely unlikely for an in-memory buffer read.
+				// Restore the body so the downstream proxy still receives it.
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBuf))
 			}
 
 			bodyHashRaw := sha256.Sum256(bodyBuf)
@@ -236,7 +255,48 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 		}
 
 		method := c.Request.Method
-		path := c.Request.URL.RequestURI() // includes query string
+
+		// Compute the path field over EXACTLY the path the downstream will see (post
+		// /api/<svc> prefix strip). The proxy strips the prefix before forwarding, so
+		// the downstream verifier's URL.RequestURI() is the post-strip path.
+		//
+		// For routes already in their final form (/v1/me/*, /v1/auth/logout):
+		// c.Param("svc") is empty, UpstreamPathForSigning returns the path unchanged.
+		//
+		// For /api/:svc/* routes: c.Param("svc") is the service name; strip /api/<svc>.
+		//
+		// UpstreamPathForSigning also normalises the path (path.Clean), which matches
+		// the proxy's own normalisation — preserving the invariant that signer and
+		// forwarder see the same cleaned path.
+		//
+		// Preserve the query string (downstream verifier uses URL.RequestURI() =
+		// path + "?" + rawQuery).
+		rawPath := c.Request.URL.Path
+		svc := c.Param("svc")
+
+		var signingPath string
+		if svc != "" {
+			stripped, valid := proxy.UpstreamPathForSigning(rawPath, svc)
+			if !valid {
+				// Path contained null bytes / CRLF — already blocked by the proxy guard,
+				// but be defensive here too.
+				c.AbortWithStatus(http.StatusBadRequest)
+
+				return
+			}
+
+			signingPath = stripped
+		} else {
+			signingPath = rawPath
+		}
+
+		// Re-attach the raw query string so the path field matches URL.RequestURI()
+		// on the downstream side.
+		if q := c.Request.URL.RawQuery; q != "" {
+			signingPath += "?" + q
+		}
+
+		path := signingPath
 
 		canonical := fmt.Sprintf(
 			"%d\n%s\n%d\n%s\n%d\n%s\n%s",
