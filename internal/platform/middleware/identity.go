@@ -1,13 +1,18 @@
 package middleware
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/CoverOnes/gateway/internal/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -20,6 +25,65 @@ const (
 	headerGatewayTs        = "X-Gateway-Ts"
 	headerGatewaySignature = "X-Gateway-Signature"
 )
+
+// uploadRoutes is the allowlist of (method, path-prefix) pairs for which the
+// gateway signer skips reading/buffering the body and instead uses
+// bodyHashHex = hex(sha256("")) in the canonical string.
+//
+// Rationale: these are large-body multipart routes. Buffering the body here
+// would (a) truncate uploads >1 MB and (b) require re-streaming gigabytes for
+// every upload. The body-hash is replaced by the empty-body sentinel on BOTH the
+// gateway signer and the matching downstream verifier so both sides produce an
+// identical canonical string. Method + path binding still prevents cross-endpoint
+// replay regardless of body size; the 30 s skew window remains the primary replay
+// bound.
+//
+// LOCKSTEP CONTRACT: for every entry (method, pathPrefix) here, the downstream
+// service's verifier MUST list the same matching rule using the same empty-body
+// sentinel. Currently:
+//
+//	POST  /api/file/v1/files  ↔  file service verifier: POST /v1/files
+//
+// When new large-body upload endpoints are added, BOTH this allowlist and the
+// corresponding verifier allowlist must be updated in the same PR.
+var uploadRoutes = []uploadRoute{
+	{method: "POST", pathPrefix: "/api/file/v1/files"},
+}
+
+type uploadRoute struct {
+	method     string
+	pathPrefix string
+}
+
+// isUploadRoute reports whether the given method + path matches an entry in the
+// upload allowlist. The path match is exact OR prefix-followed-by-'/' so that
+// future sub-routes (e.g. /api/file/v1/files/batch) can be added by extending
+// uploadRoutes without changing this function.
+//
+// The guard REQUIRES a '/' separator after the prefix to prevent false-matches
+// on sibling paths such as /api/file/v1/files-batch or /api/file/v1/filesx:
+// those share the "/api/file/v1/files" prefix but are NOT upload routes and must
+// not use the empty-body sentinel.
+func isUploadRoute(method, path string) bool {
+	for _, r := range uploadRoutes {
+		if method != r.method {
+			continue
+		}
+
+		if path == r.pathPrefix {
+			return true
+		}
+
+		// Allow sub-paths (e.g. /api/file/v1/files/123) but require '/' separator
+		// so /api/file/v1/files-batch and /api/file/v1/filesx do not match.
+		if len(path) > len(r.pathPrefix) && path[len(r.pathPrefix)] == '/' &&
+			path[:len(r.pathPrefix)] == r.pathPrefix {
+			return true
+		}
+	}
+
+	return false
+}
 
 // identityHeaders lists all client-supplied identity headers that MUST be stripped
 // before forwarding to upstream services to prevent spoofing attacks.
@@ -140,21 +204,117 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		c.Request.Header.Set(headerGatewayTs, ts)
 
-		// Canonical string is locked by decision 2d8284a6: the literal VALUES of
-		// these headers joined by "|" in EXACTLY this order. Empty value => empty
-		// field, the "|" positions stay stable. Built from the FINAL injected
-		// values so it matches byte-for-byte what downstream recomputes.
-		canonical := strings.Join([]string{
-			c.Request.Header.Get("X-User-Id"),
-			c.Request.Header.Get("X-Kyc-Tier"),
-			c.Request.Header.Get("X-Account-Type"),
-			c.Request.Header.Get("X-Email-Verified"),
-			rid,
-			ts,
-		}, "|")
+		// Determine bodyHashHex for the canonical string.
+		//
+		// For upload routes (large-body multipart POST — see uploadRoutes): use the
+		// empty-body sentinel hex(sha256("")) and DO NOT read the body. The body
+		// streams through untouched to the upstream.  The file service verifier uses
+		// the same sentinel for the matching route, so both sides produce an identical
+		// canonical string.
+		//
+		// For all other routes: read up to 1 MB, hash the real body, then restore it.
+		// LimitReader caps at 1 MB (matching the downstream verifier's gatewayBodyLimit).
+		// NOTE: the gateway router applies a 10 MiB bodyLimitMiddleware before this
+		// middleware runs, so bodies arriving here are already capped at 10 MiB.
+		const signerBodyLimit = 1 << 20 // 1 MB — matches verifier gatewayBodyLimit
+
+		// emptyBodyHash is hex(SHA-256("")) — the sentinel used for upload routes on
+		// both the gateway signer and the downstream verifier so the canonical string
+		// is identical on both sides without reading the body.
+		const emptyBodyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+		var bodyHashHex string
+
+		if isUploadRoute(c.Request.Method, c.Request.URL.Path) {
+			// Upload route: skip body read, use empty-body sentinel.
+			// Body streams through the proxy untouched.
+			bodyHashHex = emptyBodyHash
+		} else {
+			// Non-upload route: read ≤1 MB, compute real body hash, restore body.
+			var bodyBuf []byte
+
+			if c.Request.Body != nil && c.Request.Body != http.NoBody {
+				var readErr error
+
+				bodyBuf, readErr = io.ReadAll(io.LimitReader(c.Request.Body, signerBodyLimit))
+				if readErr != nil {
+					// Body read failed — fail closed: return 502 rather than signing over
+					// sha256("") which the downstream verifier would reject as a mismatch.
+					// This is consistent with the verifier's own fail-closed posture.
+					c.AbortWithStatus(http.StatusBadGateway)
+
+					return
+				}
+
+				// Restore the body so the downstream proxy still receives it.
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+			}
+
+			bodyHashRaw := sha256.Sum256(bodyBuf)
+			bodyHashHex = hex.EncodeToString(bodyHashRaw[:])
+		}
+
+		method := c.Request.Method
+
+		// Compute the path field over EXACTLY the path the downstream will see (post
+		// /api/<svc> prefix strip). The proxy strips the prefix before forwarding, so
+		// the downstream verifier's URL.RequestURI() is the post-strip path.
+		//
+		// For routes already in their final form (/v1/me/*, /v1/auth/logout):
+		// c.Param("svc") is empty, UpstreamPathForSigning returns the path unchanged.
+		//
+		// For /api/:svc/* routes: c.Param("svc") is the service name; strip /api/<svc>.
+		//
+		// UpstreamPathForSigning also normalises the path (path.Clean), which matches
+		// the proxy's own normalisation — preserving the invariant that signer and
+		// forwarder see the same cleaned path.
+		//
+		// Preserve the query string (downstream verifier uses URL.RequestURI() =
+		// path + "?" + rawQuery).
+		rawPath := c.Request.URL.Path
+		svc := c.Param("svc")
+
+		var signingPath string
+		if svc != "" {
+			stripped, valid := proxy.UpstreamPathForSigning(rawPath, svc)
+			if !valid {
+				// Path contained null bytes / CRLF — already blocked by the proxy guard,
+				// but be defensive here too.
+				c.AbortWithStatus(http.StatusBadRequest)
+
+				return
+			}
+
+			signingPath = stripped
+		} else {
+			signingPath = rawPath
+		}
+
+		// Re-attach the raw query string so the path field matches URL.RequestURI()
+		// on the downstream side.
+		if q := c.Request.URL.RawQuery; q != "" {
+			signingPath += "?" + q
+		}
+
+		path := signingPath
+
+		canonical := fmt.Sprintf(
+			"%d\n%s\n%d\n%s\n%d\n%s\n%s",
+			len(method), method,
+			len(path), path,
+			len(bodyHashHex), bodyHashHex,
+			strings.Join([]string{
+				c.Request.Header.Get("X-User-Id"),
+				c.Request.Header.Get("X-Kyc-Tier"),
+				c.Request.Header.Get("X-Account-Type"),
+				c.Request.Header.Get("X-Email-Verified"),
+				rid,
+				ts,
+			}, "|"),
+		)
 
 		mac := hmac.New(sha256.New, hmacSecret)
-		mac.Write([]byte(canonical))
+		_, _ = mac.Write([]byte(canonical)) // hmac.Hash.Write never returns an error
 		c.Request.Header.Set(headerGatewaySignature, hex.EncodeToString(mac.Sum(nil)))
 
 		c.Next()

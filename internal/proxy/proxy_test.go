@@ -2,10 +2,15 @@ package proxy_test
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -881,46 +886,21 @@ func TestProxy_ProtectedRouteRequiresAuth(t *testing.T) {
 		"upstream must NOT be reached when Authorization header is missing")
 }
 
-// ─── M4 — HMAC canonical string: accepted risk documentation ─────────────────
+// ─── M4 — HMAC canonical string: method + path + body binding (rev2-B) ──────
 //
-// Security-engineer finding M4 notes that the HMAC X-Signature canonical string
-// does NOT bind the HTTP method or request path — the HMAC covers only the
-// request body (or a fixed nonce for bodyless requests).
+// Security-engineer finding M4 noted that the old HMAC canonical string did NOT
+// bind the HTTP method or request path. That debt has been resolved in task
+// 6-12-hmac-canonical: all 8 services (gateway signer + 7 downstream verifiers)
+// now use the §24.1 rev2-B canonical string:
 //
-// DESIGN DECISION (accepted risk, escalated to Lead):
-//   - Changing the canonical string is a coordinated breaking change that requires
-//     simultaneous rollout of all downstream services (user-service, kyc-service,
-//     contract-service) plus a key rotation.  It cannot be done unilaterally in a
-//     gateway-only PR.
-//   - Mitigation in the current design: each signed request MUST include a unique
-//     X-Request-ID.  Downstream services MUST enforce single-use X-Request-ID
-//     (idempotency key check) to prevent replay of a captured signature against a
-//     different method/path.
-//   - NOTE FOR LEAD: open a coordinated sprint to bind method+path in the canonical
-//     string and rotate HMAC keys across all services.  Track as security debt.
+//	{len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n
+//	{userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
 //
-// TestProxy_HMACSignatureNotPathBound asserts the CURRENT (accepted-risk) behavior:
-// two requests with the same identity but DIFFERENT method and path produce IDENTICAL
-// X-Gateway-Signature values — proving the canonical string does NOT bind method or path.
-//
-// WHY THIS TEST EXISTS (escalation to Lead):
-//   - Binding method+path in the canonical string is a coordinated breaking change
-//     requiring simultaneous rollout of all downstream services (user-service, kyc-service,
-//     contract-service) plus a key rotation. It cannot be done in a gateway-only PR.
-//   - Mitigation in the current design: each signed request MUST include a unique
-//     X-Request-ID. Downstream services MUST enforce single-use X-Request-ID
-//     (idempotency key check) to prevent replay of a captured signature against a
-//     different method/path.
-//   - NOTE FOR LEAD: open a coordinated sprint to bind method+path in the canonical
-//     string and rotate HMAC keys across all services. Track as security debt.
-//
-// If this test starts FAILING it means someone changed the canonical string to include
-// method/path — which is the desired end state. At that point:
-//  1. Verify all downstream services and HMAC key material have been updated.
-//  2. Update this test to assert the signatures DIFFER across method+path.
-func TestProxy_HMACSignatureNotPathBound(t *testing.T) {
-	// This test is intentionally asserting the CURRENT (accepted-risk) behavior.
-	// A failure here is a signal, not a defect — see the escalation note above.
+// TestProxy_HMACSignaturePathBound asserts the NEW (correct) behavior:
+// two requests with the same identity but DIFFERENT method and path MUST produce
+// DIFFERENT X-Gateway-Signature values — proving the canonical string NOW binds method
+// and path (cross-endpoint replay prevention).
+func TestProxy_HMACSignaturePathBound(t *testing.T) {
 	pub, priv, kid := generateEdDSAKey(t)
 
 	capturer1 := &upstreamCapturer{}
@@ -960,19 +940,245 @@ func TestProxy_HMACSignatureNotPathBound(t *testing.T) {
 	sig2 := capturer1.receivedHeaders.Get("X-Gateway-Signature")
 	require.NotEmpty(t, sig2, "X-Gateway-Signature must be set on request 2")
 
-	// BEHAVIORAL ASSERTION: the HMAC canonical string does NOT include method or path.
-	// Two requests with the same identity/request-id but different method+path must
-	// produce identical signatures under the current (accepted-risk) design.
-	//
-	// NOTE: timestamps may differ slightly if the two requests straddle a second boundary.
-	// We use the X-Gateway-Ts values to confirm the test is operating within the same
-	// second — if it isn't, the test skips to avoid a flaky failure unrelated to the
-	// canonical string invariant.
-	ts1 := capturer1.receivedHeaders.Get("X-Gateway-Ts")
-	_ = ts1
-	assert.Equal(t, sig1, sig2,
-		"M4 accepted risk: X-Gateway-Signature must be identical for requests with the same "+
-			"identity/request-id regardless of method or path (canonical string is not path-bound). "+
-			"If this assertion fails, the canonical string was changed — verify all downstream "+
-			"services and key material were updated before relaxing this assertion.")
+	// rev2-B ASSERTION: the HMAC canonical string now includes method, path, and body hash.
+	// Two requests with the same identity/request-id but DIFFERENT method+path MUST
+	// produce DIFFERENT signatures — cross-endpoint replay is prevented.
+	assert.NotEqual(t, sig1, sig2,
+		"rev2-B: X-Gateway-Signature must DIFFER for requests with different method/path "+
+			"(method and path are now bound in the canonical string, closing M4 security debt)")
+}
+
+// ─── Cross-repo lockstep test: gateway signer path == downstream verifier path ─
+//
+// This is THE test that was missing and caused the C-1 bug to ship.
+//
+// Bug: the gateway signer used URL.RequestURI() = /api/file/v1/files (gateway-side
+// path), but the downstream verifier used URL.RequestURI() = /v1/files (post-strip
+// path, what the proxy forwarded). Different paths → different HMAC → 401 on every
+// /api/:svc/* request in production.
+//
+// Fix: the gateway signer now strips the /api/<svc> prefix BEFORE signing, using
+// the same proxy.UpstreamPathForSigning logic the proxy uses for forwarding.
+//
+// Downstream-verifier canonical (ref: file/internal/platform/middleware/gateway_signature.go):
+//
+//	{len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n
+//	{userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
+//
+// where path = URL.RequestURI() on the downstream side = post-strip path.
+//
+// Each sub-test covers one of the three route shapes:
+// (a) /api/:svc/* — path gets stripped (the bug case)
+// (b) /api/file/v1/files — upload route, empty-body sentinel, path also stripped
+// (c) /v1/me/* — path NOT stripped (already the final path)
+
+// downstreamCanonical rebuilds the §24.1 rev2-B canonical string exactly as a
+// downstream verifier would, given the downstream-side path (post-strip) and
+// a pre-computed body hash.
+func downstreamCanonical(method, downstreamPath, bodyHashHex,
+	userID, kycTier, accountType, emailVerified, requestID, ts string,
+) string {
+	return fmt.Sprintf(
+		"%d\n%s\n%d\n%s\n%d\n%s\n%s",
+		len(method), method,
+		len(downstreamPath), downstreamPath,
+		len(bodyHashHex), bodyHashHex,
+		strings.Join([]string{userID, kycTier, accountType, emailVerified, requestID, ts}, "|"),
+	)
+}
+
+// computeHMAC returns hex(HMAC-SHA256(secret, msg)).
+func computeHMAC(secret []byte, msg string) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(msg))
+
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// buildRouterWithHMACAndServices builds a RouterConfig with the given services.
+// mirrors buildRouterWithHMAC but accepts a map of service names → upstream URLs.
+func buildRouterWithHMACAndServices(
+	t *testing.T,
+	pub ed25519.PublicKey, kid string,
+	services map[string]string,
+	hmacSecret []byte,
+) *handler.RouterConfig {
+	t.Helper()
+
+	x := base64.RawURLEncoding.EncodeToString(pub)
+
+	jwksServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[{"kty":"OKP","crv":"Ed25519","use":"sig","alg":"EdDSA","kid":"` + kid + `","x":"` + x + `"}]}`))
+	}))
+	t.Cleanup(jwksServer.Close)
+
+	cache := jwks.NewCache(jwksServer.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(t.Context())
+
+	verifier := jwt.NewVerifier(cache, "coverones-user", "coverones", 60)
+
+	table := make(config.RouteTable, len(services))
+	for svc, url := range services {
+		table[svc] = config.UpstreamEntry{BaseURL: url}
+	}
+
+	return &handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           cache,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          hmacSecret,
+	}
+}
+
+// TestProxy_CrossRepoLockstep_SignerPathMatchesVerifierPath is the regression
+// test for C-1. It MUST fail against the buggy code (gateway signs over
+// /api/file/v1/files) and MUST pass after the fix (gateway signs over /v1/files).
+//
+// The test uses the real router (handler.NewRouter) with a real upstream capturer
+// so the signature that ends up in X-Gateway-Signature was produced by the actual
+// InjectIdentity middleware, then recomputes the canonical the way a downstream
+// verifier would and asserts they produce the same HMAC.
+func TestProxy_CrossRepoLockstep_SignerPathMatchesVerifierPath(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, kid := generateEdDSAKey(t)
+	testHMACKey := []byte("cross-repo-lockstep-test-hmac-key-0123456789")
+
+	const emptyBodyHashHex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	tests := []struct {
+		name string
+		// Gateway-side values (what the client sends to the gateway).
+		gatewayPath string
+		method      string
+		body        []byte
+		// Downstream-side path (what the proxy forwards after stripping /api/<svc>).
+		downstreamPath string
+		// bodyHashHex for the downstream canonical.
+		// For upload routes: emptyBodyHashHex. For others: sha256(body).
+		bodyHashHex func(body []byte) string
+	}{
+		{
+			name:           "(a) normal /api/:svc/* route — path is stripped",
+			gatewayPath:    "/api/user/v1/me",
+			method:         http.MethodGet,
+			body:           nil,
+			downstreamPath: "/v1/me",
+			bodyHashHex: func(body []byte) string {
+				h := sha256.Sum256(body)
+				return hex.EncodeToString(h[:])
+			},
+		},
+		{
+			name:           "(b) upload route /api/file/v1/files — path stripped + empty-body sentinel",
+			gatewayPath:    "/api/file/v1/files",
+			method:         http.MethodPost,
+			body:           []byte("large-multipart-body-that-is-not-read"),
+			downstreamPath: "/v1/files",
+			bodyHashHex: func(_ []byte) string {
+				return emptyBodyHashHex // upload route always uses the sentinel
+			},
+		},
+		{
+			name:           "(c) /v1/me/* route — path NOT stripped",
+			gatewayPath:    "/v1/me/profile",
+			method:         http.MethodGet,
+			body:           nil,
+			downstreamPath: "/v1/me/profile", // same: no /api/<svc> prefix present
+			bodyHashHex: func(body []byte) string {
+				h := sha256.Sum256(body)
+				return hex.EncodeToString(h[:])
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			capturer := &upstreamCapturer{responseStatus: http.StatusOK}
+			upstream := httptest.NewServer(capturer)
+			defer upstream.Close()
+
+			// All tests need both "user" (for /v1/me/* and /api/user/*) and
+			// "file" (for /api/file/v1/files). Using the multi-service helper
+			// ensures the route table covers all three test cases.
+			routerCfg := buildRouterWithHMACAndServices(t, pub, kid, map[string]string{
+				"user": upstream.URL,
+				"file": upstream.URL,
+			}, testHMACKey)
+			r, err := handler.NewRouter(routerCfg)
+			require.NoError(t, err)
+
+			tokenStr := signTestToken(t, priv, kid, "lockstep-user-sub")
+
+			const fixedRequestID = "req-lockstep-fixed-001"
+			var reqBody *strings.Reader
+			if tc.body != nil {
+				reqBody = strings.NewReader(string(tc.body))
+			} else {
+				reqBody = strings.NewReader("")
+			}
+
+			req := httptest.NewRequestWithContext(t.Context(), tc.method, tc.gatewayPath, reqBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+			req.Header.Set("X-Request-ID", fixedRequestID)
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code,
+				"router must reach upstream for %q", tc.gatewayPath)
+
+			gotSig := capturer.receivedHeaders.Get("X-Gateway-Signature")
+			require.NotEmpty(t, gotSig, "X-Gateway-Signature must be set")
+
+			ts := capturer.receivedHeaders.Get("X-Gateway-Ts")
+			require.NotEmpty(t, ts, "X-Gateway-Ts must be set")
+
+			// Read the injected identity headers (what the downstream verifier will see).
+			userID := capturer.receivedHeaders.Get("X-User-Id")
+			kycTier := capturer.receivedHeaders.Get("X-Kyc-Tier")
+			acctType := capturer.receivedHeaders.Get("X-Account-Type")
+			emailVerif := capturer.receivedHeaders.Get("X-Email-Verified")
+			requestID := capturer.receivedHeaders.Get("X-Request-ID")
+
+			// Compute the body hash the way the downstream verifier would.
+			bodyHashHex := tc.bodyHashHex(tc.body)
+
+			// Rebuild the canonical string exactly as a downstream verifier does —
+			// using the POST-STRIP (downstream) path, NOT the gateway-side path.
+			canonical := downstreamCanonical(tc.method, tc.downstreamPath, bodyHashHex,
+				userID, kycTier, acctType, emailVerif, requestID, ts)
+
+			wantSig := computeHMAC(testHMACKey, canonical)
+
+			assert.Equal(t, wantSig, gotSig,
+				"[C-1 lockstep] gateway signer HMAC must equal the downstream verifier HMAC: "+
+					"gateway signed over %q, downstream verifies over %q",
+				tc.gatewayPath, tc.downstreamPath)
+
+			// Sanity: recompute over the GATEWAY-SIDE path to prove it does NOT match —
+			// this assertion documents the pre-fix bug and would PASS if the bug were
+			// reintroduced (the gateway path != downstream path for /api/:svc/* routes).
+			if tc.gatewayPath != tc.downstreamPath {
+				wrongCanonical := downstreamCanonical(tc.method, tc.gatewayPath, bodyHashHex,
+					userID, kycTier, acctType, emailVerif, requestID, ts)
+				wrongSig := computeHMAC(testHMACKey, wrongCanonical)
+				assert.NotEqual(t, wrongSig, gotSig,
+					"[C-1 regression] signature over gateway-side path MUST NOT match — "+
+						"if this fails the C-1 bug was reintroduced (gateway path != downstream path)")
+			}
+
+			// Parse and validate ts (sanity check on the signing output).
+			_, err = strconv.ParseInt(ts, 10, 64)
+			assert.NoError(t, err, "X-Gateway-Ts must be a valid Unix timestamp")
+		})
+	}
 }

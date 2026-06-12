@@ -201,6 +201,14 @@ func decodePathFully(s string) string {
 // (%252500, %25252500, …) are fully unwrapped before the byte check — closing ALL
 // n-level encoding bypass variants including triple and quad encoding.
 // Callers MUST reject the request when the return value is false.
+//
+// UpstreamPathForSigning exposes the same transformation for use by the HMAC
+// signer in the middleware layer: the signer MUST sign over the exact path the
+// downstream receives (post-strip), not the raw gateway-side path.
+func UpstreamPathForSigning(requestPath, svc string) (string, bool) {
+	return upstreamPath(requestPath, svc)
+}
+
 func upstreamPath(requestPath, svc string) (string, bool) {
 	// Strip /api/<svc> prefix.
 	stripped := strings.TrimPrefix(requestPath, "/api/"+svc)
