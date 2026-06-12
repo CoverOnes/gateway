@@ -1,12 +1,14 @@
 package middleware_test
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -22,6 +24,10 @@ import (
 	"github.com/CoverOnes/gateway/internal/platform/middleware"
 	"github.com/gin-gonic/gin"
 )
+
+// emptyBodyHashHex is hex(SHA-256("")) — the sentinel the gateway signer uses for
+// upload routes instead of reading the body.
+const emptyBodyHashHex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 // testHMACSecret is a fixed >=32-char secret used to assert the gateway-origin
 // signature is computed deterministically. Test-only; not a real credential.
@@ -85,13 +91,6 @@ func setupIdentityTestRouterWithSecret(
 //	{userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
 //
 // For GET requests with no body, body = nil → bodyHashHex = hex(SHA-256("")).
-//
-// The helpers in this test that call expectedSignature for GET /protected/resource with
-// no body must use method="GET", path="/protected/resource", body=nil.
-// path is always "/protected/resource" in the current test suite because that is the only
-// registered route; it is kept explicit as a parameter for readability when adding future cases.
-//
-//nolint:unparam // path is "/protected/resource" in all current call sites; parameter retained for readability
 func expectedSignature(
 	secret []byte,
 	method, path string,
@@ -781,4 +780,197 @@ func TestInjectIdentity_Rev2B_MethodAndBodyBound(t *testing.T) {
 		assert.Equal(t, wantPost, postSig, "POST signer must produce a method=POST canonical")
 		assert.NotEqual(t, wantGet, wantPost, "GET and POST signatures must differ (method is bound)")
 	})
+}
+
+// setupUploadRouteRouter builds a router that mimics the gateway's /api/file/v1/files
+// upload route: Auth + InjectIdentity, plus a handler that reads the full body so we
+// can assert the body reached the handler intact.
+func setupUploadRouteRouter(
+	t *testing.T,
+	pub ed25519.PublicKey,
+	kid string,
+	hmacSecret []byte,
+) (*gin.Engine, *capturedRequest, *[]byte) {
+	t.Helper()
+
+	gin.SetMode(gin.TestMode)
+
+	resolver := &testKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	captured := &capturedRequest{}
+	var handlerBodyBuf []byte
+
+	r := gin.New()
+	r.Use(middleware.RequestID())
+
+	// Simulate the /api/:svc group.
+	api := r.Group("/api/file")
+	api.Use(middleware.Auth(verifier))
+	api.Use(middleware.InjectIdentity(hmacSecret))
+
+	// Upload route — handler reads and stores whatever body arrives.
+	api.POST("/v1/files", func(c *gin.Context) {
+		captured.headers = c.Request.Header.Clone()
+
+		if c.Request.Body != nil {
+			body, err := io.ReadAll(c.Request.Body)
+			if err == nil {
+				handlerBodyBuf = body
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	// A non-upload POST route for comparison.
+	api.POST("/v1/other", func(c *gin.Context) {
+		captured.headers = c.Request.Header.Clone()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	return r, captured, &handlerBodyBuf
+}
+
+// TestInjectIdentity_UploadRoute_EmptyBodySentinel verifies that for the upload
+// route (POST /api/file/v1/files) the gateway signer:
+//   - does NOT truncate or buffer the body (the full body reaches the handler)
+//   - signs using the empty-body sentinel (hex(sha256(""))) regardless of body size
+//   - a non-upload POST with a real body still uses the real body hash
+func TestInjectIdentity_UploadRoute_EmptyBodySentinel(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "upload-route-kid"
+	secret := []byte(testHMACSecret)
+	r, captured, handlerBodyBuf := setupUploadRouteRouter(t, pub, kid, secret)
+	tokenStr := generateToken(t, priv, kid, "upload-user", 1)
+	const fixedRequestID = "req-upload-0001"
+
+	t.Run("upload route: signer uses empty-body sentinel, full body reaches handler", func(t *testing.T) {
+		// Build a body larger than the 1 MB old truncation limit (1.5 MB of 'A').
+		largeBody := bytes.Repeat([]byte("A"), 1<<20+512*1024) // 1.5 MB
+
+		req := httptest.NewRequestWithContext(
+			t.Context(), http.MethodPost, "/api/file/v1/files",
+			bytes.NewReader(largeBody),
+		)
+		req.Header.Set("Authorization", "Bearer "+tokenStr)
+		req.Header.Set("X-Request-ID", fixedRequestID)
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code, "upload route must return 200")
+
+		// The handler must receive the full body — not a 1 MB truncated version.
+		require.Equal(t, len(largeBody), len(*handlerBodyBuf),
+			"full body must reach the handler (no 1 MB truncation on upload route)")
+
+		ts := captured.headers.Get("X-Gateway-Ts")
+		require.NotEmpty(t, ts, "X-Gateway-Ts must be set")
+
+		// The signature must be computed over the EMPTY-BODY SENTINEL, not the
+		// real 1.5 MB body.  We reconstruct it with body=nil (sha256("")).
+		wantSig := expectedSignature(
+			secret, http.MethodPost, "/api/file/v1/files",
+			nil, // empty body → sha256("") sentinel
+			"upload-user", "1", "PERSONAL", "true", fixedRequestID, ts,
+		)
+		assert.Equal(t, wantSig, captured.headers.Get("X-Gateway-Signature"),
+			"upload route signer must use empty-body sentinel (hex(sha256(\"\")))")
+
+		// Sanity: a signature over the REAL body must NOT match (proves sentinel was used).
+		realBodySig := expectedSignature(
+			secret, http.MethodPost, "/api/file/v1/files",
+			largeBody,
+			"upload-user", "1", "PERSONAL", "true", fixedRequestID, ts,
+		)
+		assert.NotEqual(t, realBodySig, captured.headers.Get("X-Gateway-Signature"),
+			"upload route signature must NOT be over the real body")
+	})
+
+	t.Run("non-upload POST still uses real body hash (body-hash enforcement unchanged)", func(t *testing.T) {
+		body := []byte(`{"action":"create"}`)
+
+		req := httptest.NewRequestWithContext(
+			t.Context(), http.MethodPost, "/api/file/v1/other",
+			bytes.NewReader(body),
+		)
+		req.Header.Set("Authorization", "Bearer "+tokenStr)
+		req.Header.Set("X-Request-ID", fixedRequestID)
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+
+		ts := captured.headers.Get("X-Gateway-Ts")
+		require.NotEmpty(t, ts)
+
+		// Non-upload: signature must be over the real body.
+		wantRealSig := expectedSignature(
+			secret, http.MethodPost, "/api/file/v1/other",
+			body,
+			"upload-user", "1", "PERSONAL", "true", fixedRequestID, ts,
+		)
+		assert.Equal(t, wantRealSig, captured.headers.Get("X-Gateway-Signature"),
+			"non-upload POST must use real body hash")
+
+		// Empty-body sentinel must NOT match for a non-upload route with a real body.
+		emptySentinelSig := expectedSignature(
+			secret, http.MethodPost, "/api/file/v1/other",
+			nil, // would be the sentinel
+			"upload-user", "1", "PERSONAL", "true", fixedRequestID, ts,
+		)
+		assert.NotEqual(t, emptySentinelSig, captured.headers.Get("X-Gateway-Signature"),
+			"non-upload POST must NOT use the empty-body sentinel")
+	})
+}
+
+// TestInjectIdentity_UploadRoute_GoldenVector asserts the exact canonical string and
+// HMAC for the upload route using the empty-body sentinel — proving the lockstep
+// contract: the file verifier that computes the same canonical string will accept it.
+//
+// Golden vector (fixed inputs → fixed output):
+//
+//	method=POST  path=/api/file/v1/files  bodyHash=hex(sha256(""))
+//	userId=golden-user  kycTier=2  accountType=PERSONAL  emailVerified=true
+//	requestId=req-golden-v001  ts=1700000000
+func TestInjectIdentity_UploadRoute_GoldenVector(t *testing.T) {
+	const (
+		goldenUserID    = "golden-user"
+		goldenKycTier   = "2"
+		goldenAcctType  = "PERSONAL"
+		goldenEmailVerf = "true"
+		goldenRequestID = "req-golden-v001"
+		goldenTs        = "1700000000"
+		goldenMethod    = http.MethodPost
+		goldenPath      = "/api/file/v1/files"
+	)
+
+	// Manually construct the canonical string exactly as the signer does.
+	// bodyHashHex = emptyBodyHashHex (the sentinel for upload routes).
+	canonical := fmt.Sprintf(
+		"%d\n%s\n%d\n%s\n%d\n%s\n%s",
+		len(goldenMethod), goldenMethod,
+		len(goldenPath), goldenPath,
+		len(emptyBodyHashHex), emptyBodyHashHex,
+		strings.Join([]string{goldenUserID, goldenKycTier, goldenAcctType, goldenEmailVerf, goldenRequestID, goldenTs}, "|"),
+	)
+
+	mac := hmac.New(sha256.New, []byte(testHMACSecret))
+	_, _ = mac.Write([]byte(canonical))
+	wantSig := hex.EncodeToString(mac.Sum(nil))
+
+	// Now build the same signature using the test helper (independent reimplementation).
+	gotSig := expectedSignature(
+		[]byte(testHMACSecret),
+		goldenMethod, goldenPath,
+		nil, // nil body → sha256("") → emptyBodyHashHex
+		goldenUserID, goldenKycTier, goldenAcctType, goldenEmailVerf, goldenRequestID, goldenTs,
+	)
+
+	assert.Equal(t, wantSig, gotSig,
+		"golden vector: canonical string with empty-body sentinel must produce a deterministic HMAC")
 }

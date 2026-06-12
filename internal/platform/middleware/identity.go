@@ -25,6 +25,49 @@ const (
 	headerGatewaySignature = "X-Gateway-Signature"
 )
 
+// uploadRoutes is the allowlist of (method, path-prefix) pairs for which the
+// gateway signer skips reading/buffering the body and instead uses
+// bodyHashHex = hex(sha256("")) in the canonical string.
+//
+// Rationale: these are large-body multipart routes. Buffering the body here
+// would (a) truncate uploads >1 MB and (b) require re-streaming gigabytes for
+// every upload. The body-hash is replaced by the empty-body sentinel on BOTH the
+// gateway signer and the matching downstream verifier so both sides produce an
+// identical canonical string. Method + path binding still prevents cross-endpoint
+// replay regardless of body size; the 30 s skew window remains the primary replay
+// bound.
+//
+// LOCKSTEP CONTRACT: for every entry (method, pathPrefix) here, the downstream
+// service's verifier MUST list the same matching rule using the same empty-body
+// sentinel. Currently:
+//
+//	POST  /api/file/v1/files  ↔  file service verifier: POST /v1/files
+//
+// When new large-body upload endpoints are added, BOTH this allowlist and the
+// corresponding verifier allowlist must be updated in the same PR.
+var uploadRoutes = []uploadRoute{
+	{method: "POST", pathPrefix: "/api/file/v1/files"},
+}
+
+type uploadRoute struct {
+	method     string
+	pathPrefix string
+}
+
+// isUploadRoute reports whether the given method + path matches an entry in the
+// upload allowlist. The path match is a prefix check so that future path params
+// (e.g. /api/file/v1/files/batch) can be added by extending uploadRoutes without
+// changing this function.
+func isUploadRoute(method, path string) bool {
+	for _, r := range uploadRoutes {
+		if method == r.method && (path == r.pathPrefix || len(path) > len(r.pathPrefix) && path[:len(r.pathPrefix)] == r.pathPrefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // identityHeaders lists all client-supplied identity headers that MUST be stripped
 // before forwarding to upstream services to prevent spoofing attacks.
 //
@@ -144,42 +187,53 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		c.Request.Header.Set(headerGatewayTs, ts)
 
-		// Read and buffer the request body so we can hash it for the canonical string,
-		// then restore it so the downstream proxy can still forward the original body.
+		// Determine bodyHashHex for the canonical string.
+		//
+		// For upload routes (large-body multipart POST — see uploadRoutes): use the
+		// empty-body sentinel hex(sha256("")) and DO NOT read the body. The body
+		// streams through untouched to the upstream.  The file service verifier uses
+		// the same sentinel for the matching route, so both sides produce an identical
+		// canonical string.
+		//
+		// For all other routes: read up to 1 MB, hash the real body, then restore it.
 		// LimitReader caps at 1 MB (matching the downstream verifier's gatewayBodyLimit).
-		// Requests larger than 1 MB are still proxied but only the first 1 MB contributes
-		// to the hash — consistent with the downstream verifier's read cap.
 		// NOTE: the gateway router applies a 10 MiB bodyLimitMiddleware before this
 		// middleware runs, so bodies arriving here are already capped at 10 MiB.
 		const signerBodyLimit = 1 << 20 // 1 MB — matches verifier gatewayBodyLimit
 
-		var bodyBuf []byte
+		// emptyBodyHash is hex(SHA-256("")) — the sentinel used for upload routes on
+		// both the gateway signer and the downstream verifier so the canonical string
+		// is identical on both sides without reading the body.
+		const emptyBodyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-		if c.Request.Body != nil && c.Request.Body != http.NoBody {
-			var readErr error
+		var bodyHashHex string
 
-			bodyBuf, readErr = io.ReadAll(io.LimitReader(c.Request.Body, signerBodyLimit))
-			if readErr == nil {
-				// Restore the body so the downstream proxy still receives it.
-				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+		if isUploadRoute(c.Request.Method, c.Request.URL.Path) {
+			// Upload route: skip body read, use empty-body sentinel.
+			// Body streams through the proxy untouched.
+			bodyHashHex = emptyBodyHash
+		} else {
+			// Non-upload route: read ≤1 MB, compute real body hash, restore body.
+			var bodyBuf []byte
+
+			if c.Request.Body != nil && c.Request.Body != http.NoBody {
+				var readErr error
+
+				bodyBuf, readErr = io.ReadAll(io.LimitReader(c.Request.Body, signerBodyLimit))
+				if readErr == nil {
+					// Restore the body so the downstream proxy still receives it.
+					c.Request.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+				}
+
+				// On read error: leave bodyBuf nil → hash of nil = sha256("") consistent
+				// with the verifier's empty-body path. Body will be read again by proxy
+				// using the already-consumed reader — proxy handles this gracefully (sends
+				// empty body). This path is extremely unlikely for an in-memory buffer read.
 			}
 
-			// On read error: leave bodyBuf nil → hash of nil = sha256("") consistent
-			// with the verifier's empty-body path. Body will be read again by proxy
-			// using the already-consumed reader — proxy handles this gracefully (sends
-			// empty body). This path is extremely unlikely for an in-memory buffer read.
+			bodyHashRaw := sha256.Sum256(bodyBuf)
+			bodyHashHex = hex.EncodeToString(bodyHashRaw[:])
 		}
-
-		// Canonical string format (§24.1 rev2-B, length-prefix framing):
-		//   {len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n
-		//   {userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
-		//
-		// URL.RequestURI() includes the query string, binding the signature to the
-		// exact endpoint the request targets (prevents cross-endpoint replay).
-		// Length-prefix framing prevents cross-field collision even when field values
-		// contain '\n' or '|'.
-		bodyHashRaw := sha256.Sum256(bodyBuf)
-		bodyHashHex := hex.EncodeToString(bodyHashRaw[:])
 
 		method := c.Request.Method
 		path := c.Request.URL.RequestURI() // includes query string
