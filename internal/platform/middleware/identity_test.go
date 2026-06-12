@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -76,13 +77,31 @@ func setupIdentityTestRouterWithSecret(
 }
 
 // expectedSignature recomputes the gateway-origin HMAC the way a downstream
-// service MUST (CONVENTIONS §24): hex(HMAC-SHA256(secret, canonicalString)) where
-// canonicalString = the literal header values joined by "|" in the locked order
-// X-User-Id|X-Kyc-Tier|X-Account-Type|X-Email-Verified|X-Request-ID|X-Gateway-Ts.
-func expectedSignature(secret []byte, userID, kycTier, accountType, emailVerified, requestID, ts string) string {
-	canonical := strings.Join([]string{userID, kycTier, accountType, emailVerified, requestID, ts}, "|")
+// service MUST (CONVENTIONS §24.1 rev2-B): hex(HMAC-SHA256(secret, canonicalString))
+// where canonicalString uses length-prefix framing over (method, path, bodyHashHex)
+// followed by the identity tuple pipe-delimited:
+//
+//	{len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n
+//	{userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
+//
+// For GET requests with no body, body = nil → bodyHashHex = hex(SHA-256("")).
+//
+// The helpers in this test that call expectedSignature for GET /protected/resource with
+// no body must use method="GET", path="/protected/resource", body=nil.
+func expectedSignature(secret []byte, method, path string, body []byte, userID, kycTier, accountType, emailVerified, requestID, ts string) string {
+	bodyHashRaw := sha256.Sum256(body)
+	bodyHashHex := hex.EncodeToString(bodyHashRaw[:])
+
+	canonical := fmt.Sprintf(
+		"%d\n%s\n%d\n%s\n%d\n%s\n%s",
+		len(method), method,
+		len(path), path,
+		len(bodyHashHex), bodyHashHex,
+		strings.Join([]string{userID, kycTier, accountType, emailVerified, requestID, ts}, "|"),
+	)
+
 	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(canonical))
+	_, _ = mac.Write([]byte(canonical)) // hmac.Hash.Write never errors
 
 	return hex.EncodeToString(mac.Sum(nil))
 }
@@ -484,11 +503,12 @@ func TestInjectIdentity_GatewaySignatureMatchesExpectedHMAC(t *testing.T) {
 
 			// The signature MUST be computed over the injected (JWT-derived) values:
 			// the real tier from the token, NOT the forged "9".
-			want := expectedSignature(secret, "sig-user-sub", tc.wantTier, "PERSONAL", tc.wantEmailVerf, fixedRequestID, ts)
+			// GET /protected/resource with no body → body=nil.
+			want := expectedSignature(secret, http.MethodGet, "/protected/resource", nil, "sig-user-sub", tc.wantTier, "PERSONAL", tc.wantEmailVerf, fixedRequestID, ts)
 			assert.Equal(t, want, captured.headers.Get("X-Gateway-Signature"),
 				"X-Gateway-Signature must equal HMAC over the locked canonical string of the injected values")
 			// Sanity: a signature over the forged tier must NOT match — proves we signed real values.
-			forged := expectedSignature(secret, "sig-user-sub", "9", "PERSONAL", tc.wantEmailVerf, fixedRequestID, ts)
+			forged := expectedSignature(secret, http.MethodGet, "/protected/resource", nil, "sig-user-sub", "9", "PERSONAL", tc.wantEmailVerf, fixedRequestID, ts)
 			assert.NotEqual(t, forged, captured.headers.Get("X-Gateway-Signature"),
 				"signature must not validate against forged client-supplied values")
 		})
@@ -557,7 +577,8 @@ func TestInjectIdentity_ClientSuppliedSignatureHeadersAreStripped(t *testing.T) 
 		"client-supplied X-Gateway-Signature must be stripped, not forwarded")
 
 	// The surviving signature must be the gateway's own over the real values.
-	want := expectedSignature(secret, "strip-user", "1", "PERSONAL", "true", fixedRequestID, ts)
+	// GET /protected/resource with no body → body=nil.
+	want := expectedSignature(secret, http.MethodGet, "/protected/resource", nil, "strip-user", "1", "PERSONAL", "true", fixedRequestID, ts)
 	assert.Equal(t, want, gotSig,
 		"surviving signature must be the gateway's own HMAC over injected values")
 }
@@ -636,7 +657,115 @@ func TestInjectIdentity_EmptyFieldKeepsPipePositions(t *testing.T) {
 	ts := captured.headers.Get("X-Gateway-Ts")
 	require.NotEmpty(t, ts)
 	// Canonical string has an empty 3rd field but the "|" positions are preserved.
-	want := expectedSignature(secret, "empty-acct-user", "1", "", "true", fixedRequestID, ts)
+	// GET /protected/resource with no body → body=nil.
+	want := expectedSignature(secret, http.MethodGet, "/protected/resource", nil, "empty-acct-user", "1", "", "true", fixedRequestID, ts)
 	assert.Equal(t, want, captured.headers.Get("X-Gateway-Signature"),
 		"empty field must keep its | position in the canonical string")
+}
+
+// setupIdentityTestRouterWithPost builds a router with GET + POST /protected/resource.
+func setupIdentityTestRouterWithPost(t *testing.T, pub ed25519.PublicKey, kid string, hmacSecret []byte) (*gin.Engine, *capturedRequest) {
+	t.Helper()
+
+	gin.SetMode(gin.TestMode)
+
+	resolver := &testKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	captured := &capturedRequest{}
+
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	protected := r.Group("/protected")
+	protected.Use(middleware.Auth(verifier))
+	protected.Use(middleware.InjectIdentity(hmacSecret))
+	protected.GET("/resource", func(c *gin.Context) {
+		captured.headers = c.Request.Header.Clone()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	protected.POST("/resource", func(c *gin.Context) {
+		captured.headers = c.Request.Header.Clone()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	return r, captured
+}
+
+// TestInjectIdentity_Rev2B_MethodAndBodyBound asserts that the gateway signer binds
+// both the HTTP method and the request body into the canonical string (rev2-B additions
+// over the earlier identity-tuple-only rev1).
+//
+// A GET signature must NOT pass for a POST to the same path (method-swap).
+// A POST signature over body A must NOT pass for body B (body-tamper).
+func TestInjectIdentity_Rev2B_MethodAndBodyBound(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	kid := "rev2b-test-kid"
+	secret := []byte(testHMACSecret)
+	r, captured := setupIdentityTestRouterWithPost(t, pub, kid, secret)
+
+	tokenStr := generateToken(t, priv, kid, "rev2b-user", 1)
+	const fixedRequestID = "req-rev2b-0004"
+
+	t.Run("POST body is bound in canonical — different body changes signature", func(t *testing.T) {
+		body := []byte(`{"amount":100}`)
+
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/protected/resource",
+			strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer "+tokenStr)
+		req.Header.Set("X-Request-ID", fixedRequestID)
+
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+
+		ts := captured.headers.Get("X-Gateway-Ts")
+		require.NotEmpty(t, ts)
+
+		// Signature over the body that was actually sent.
+		wantWithBody := expectedSignature(secret, http.MethodPost, "/protected/resource", body, "rev2b-user", "1", "PERSONAL", "true", fixedRequestID, ts)
+		assert.Equal(t, wantWithBody, captured.headers.Get("X-Gateway-Signature"),
+			"signer must compute HMAC over the actual POST body (rev2-B body binding)")
+
+		// Signature over a different body must NOT match.
+		wantWrongBody := expectedSignature(secret, http.MethodPost, "/protected/resource", []byte(`{"amount":9999}`), "rev2b-user", "1", "PERSONAL", "true", fixedRequestID, ts)
+		assert.NotEqual(t, wantWrongBody, captured.headers.Get("X-Gateway-Signature"),
+			"signature must not match a different body (rev2-B body binding prevents body tamper)")
+	})
+
+	t.Run("GET signature is NOT identical to POST signature (method bound)", func(t *testing.T) {
+		// GET request.
+		getReq := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/protected/resource", http.NoBody)
+		getReq.Header.Set("Authorization", "Bearer "+tokenStr)
+		getReq.Header.Set("X-Request-ID", fixedRequestID)
+
+		wGet := httptest.NewRecorder()
+		r.ServeHTTP(wGet, getReq)
+		require.Equal(t, http.StatusOK, wGet.Code)
+
+		getTs := captured.headers.Get("X-Gateway-Ts")
+		getSig := captured.headers.Get("X-Gateway-Signature")
+
+		// POST request (same path, no body for simplicity).
+		postReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/protected/resource", http.NoBody)
+		postReq.Header.Set("Authorization", "Bearer "+tokenStr)
+		postReq.Header.Set("X-Request-ID", fixedRequestID)
+
+		wPost := httptest.NewRecorder()
+		r.ServeHTTP(wPost, postReq)
+		require.Equal(t, http.StatusOK, wPost.Code)
+
+		postTs := captured.headers.Get("X-Gateway-Ts")
+		postSig := captured.headers.Get("X-Gateway-Signature")
+
+		// Verify each signature matches its respective method.
+		wantGet := expectedSignature(secret, http.MethodGet, "/protected/resource", nil, "rev2b-user", "1", "PERSONAL", "true", fixedRequestID, getTs)
+		wantPost := expectedSignature(secret, http.MethodPost, "/protected/resource", nil, "rev2b-user", "1", "PERSONAL", "true", fixedRequestID, postTs)
+
+		assert.Equal(t, wantGet, getSig, "GET signer must produce a method=GET canonical")
+		assert.Equal(t, wantPost, postSig, "POST signer must produce a method=POST canonical")
+		assert.NotEqual(t, wantGet, wantPost, "GET and POST signatures must differ (method is bound)")
+	})
 }

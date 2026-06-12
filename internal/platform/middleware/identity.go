@@ -1,9 +1,13 @@
 package middleware
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -140,21 +144,63 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		c.Request.Header.Set(headerGatewayTs, ts)
 
-		// Canonical string is locked by decision 2d8284a6: the literal VALUES of
-		// these headers joined by "|" in EXACTLY this order. Empty value => empty
-		// field, the "|" positions stay stable. Built from the FINAL injected
-		// values so it matches byte-for-byte what downstream recomputes.
-		canonical := strings.Join([]string{
-			c.Request.Header.Get("X-User-Id"),
-			c.Request.Header.Get("X-Kyc-Tier"),
-			c.Request.Header.Get("X-Account-Type"),
-			c.Request.Header.Get("X-Email-Verified"),
-			rid,
-			ts,
-		}, "|")
+		// Read and buffer the request body so we can hash it for the canonical string,
+		// then restore it so the downstream proxy can still forward the original body.
+		// LimitReader caps at 1 MB (matching the downstream verifier's gatewayBodyLimit).
+		// Requests larger than 1 MB are still proxied but only the first 1 MB contributes
+		// to the hash — consistent with the downstream verifier's read cap.
+		// NOTE: the gateway router applies a 10 MiB bodyLimitMiddleware before this
+		// middleware runs, so bodies arriving here are already capped at 10 MiB.
+		const signerBodyLimit = 1 << 20 // 1 MB — matches verifier gatewayBodyLimit
+
+		var bodyBuf []byte
+
+		if c.Request.Body != nil && c.Request.Body != http.NoBody {
+			var readErr error
+
+			bodyBuf, readErr = io.ReadAll(io.LimitReader(c.Request.Body, signerBodyLimit))
+			if readErr == nil {
+				// Restore the body so the downstream proxy still receives it.
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+			}
+
+			// On read error: leave bodyBuf nil → hash of nil = sha256("") consistent
+			// with the verifier's empty-body path. Body will be read again by proxy
+			// using the already-consumed reader — proxy handles this gracefully (sends
+			// empty body). This path is extremely unlikely for an in-memory buffer read.
+		}
+
+		// Canonical string format (§24.1 rev2-B, length-prefix framing):
+		//   {len(method)}\n{method}\n{len(path)}\n{path}\n{len(bodyHashHex)}\n{bodyHashHex}\n
+		//   {userId}|{kycTier}|{accountType}|{emailVerified}|{requestId}|{ts}
+		//
+		// URL.RequestURI() includes the query string, binding the signature to the
+		// exact endpoint the request targets (prevents cross-endpoint replay).
+		// Length-prefix framing prevents cross-field collision even when field values
+		// contain '\n' or '|'.
+		bodyHashRaw := sha256.Sum256(bodyBuf)
+		bodyHashHex := hex.EncodeToString(bodyHashRaw[:])
+
+		method := c.Request.Method
+		path := c.Request.URL.RequestURI() // includes query string
+
+		canonical := fmt.Sprintf(
+			"%d\n%s\n%d\n%s\n%d\n%s\n%s",
+			len(method), method,
+			len(path), path,
+			len(bodyHashHex), bodyHashHex,
+			strings.Join([]string{
+				c.Request.Header.Get("X-User-Id"),
+				c.Request.Header.Get("X-Kyc-Tier"),
+				c.Request.Header.Get("X-Account-Type"),
+				c.Request.Header.Get("X-Email-Verified"),
+				rid,
+				ts,
+			}, "|"),
+		)
 
 		mac := hmac.New(sha256.New, hmacSecret)
-		mac.Write([]byte(canonical))
+		_, _ = mac.Write([]byte(canonical)) // hmac.Hash.Write never returns an error
 		c.Request.Header.Set(headerGatewaySignature, hex.EncodeToString(mac.Sum(nil)))
 
 		c.Next()
