@@ -77,12 +77,35 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 			// or overrides these headers would otherwise be able to weaken the
 			// client-side security posture. Re-setting them here ensures the gateway
 			// always controls the final values regardless of what the upstream sends.
+			//
+			// CORS sole-authority: strip ALL upstream CORS headers so that only the
+			// gateway's own CORS middleware (internal/platform/middleware/cors.go) sets
+			// CORS headers on the final response. Without this strip, upstreams that run
+			// their own CORS middleware (e.g. chat-gateway) produce duplicate
+			// Access-Control-Allow-Origin values, which the Fetch spec treats as a CORS
+			// failure — blocking the response body in the browser.
+			// Vary is also stripped because the gateway's CORS middleware re-adds
+			// "Vary: Origin" when the request Origin is allowed, ensuring the correct
+			// single value survives.
 			ModifyResponse: func(resp *http.Response) error {
 				resp.Header.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
 				resp.Header.Set("X-Content-Type-Options", "nosniff")
 				resp.Header.Set("X-Frame-Options", "DENY")
 				resp.Header.Set("Referrer-Policy", "no-referrer")
 				resp.Header.Set("Content-Security-Policy", "default-src 'none'")
+
+				// Strip upstream CORS headers — gateway is the sole CORS authority.
+				for _, h := range []string{
+					"Access-Control-Allow-Origin",
+					"Access-Control-Allow-Credentials",
+					"Access-Control-Allow-Methods",
+					"Access-Control-Allow-Headers",
+					"Access-Control-Expose-Headers",
+					"Access-Control-Max-Age",
+					"Vary",
+				} {
+					resp.Header.Del(h)
+				}
 
 				return nil
 			},
