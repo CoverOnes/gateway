@@ -218,6 +218,26 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 		registry.Forward(c, "user")
 	})
 
+	// SSE stream route — scoped exception for browser EventSource which cannot send
+	// Authorization headers. Accepts JWT via access_token query param on this ONE route
+	// only. SSEAuth validates identically to Auth (same JWKS verifier + claim set).
+	// The access_token param is redacted from the URL before InjectIdentity so it is
+	// never logged and not included in the HMAC-signed path.
+	//
+	// SECURITY SCOPE RED-LINE: this pattern MUST NOT be copied to any other route.
+	// All other routes MUST use the Bearer Auth() middleware. See middleware.SSEAuth
+	// for the full security rationale.
+	r.GET(
+		"/api/chat/v1/messages/stream",
+		bodyLimitMiddleware(bodyLimitAPI),
+		middleware.SSEAuth(cfg.Verifier),
+		userRL.Handler(),
+		middleware.InjectIdentity(cfg.HMACSecret),
+		func(c *gin.Context) {
+			registry.Forward(c, "chat")
+		},
+	)
+
 	// Protected proxy routes — Auth + PerUserRateLimit + InjectIdentity required.
 	// /api/:svc/* pattern with allowlist-only forwarding.
 	api := r.Group("/api/:svc")
