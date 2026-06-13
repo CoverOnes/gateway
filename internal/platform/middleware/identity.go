@@ -265,6 +265,11 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 		//
 		// For /api/:svc/* routes: c.Param("svc") is the service name; strip /api/<svc>.
 		//
+		// For routes registered without the /:svc/ param (e.g. the SSE stream route
+		// /api/chat/v1/messages/stream), the upstream middleware sets "svc" via c.Set
+		// so that InjectIdentity still strips the correct prefix and the downstream
+		// verifier receives a matching signed path.
+		//
 		// UpstreamPathForSigning also normalises the path (path.Clean), which matches
 		// the proxy's own normalisation — preserving the invariant that signer and
 		// forwarder see the same cleaned path.
@@ -272,11 +277,17 @@ func InjectIdentity(hmacSecret []byte) gin.HandlerFunc {
 		// Preserve the query string (downstream verifier uses URL.RequestURI() =
 		// path + "?" + rawQuery).
 		rawPath := c.Request.URL.Path
-		svc := c.Param("svc")
+		// Prefer the gin-context "svc" key (set by SSEAuth on routes without /:svc/)
+		// over the URL path param, falling back to c.Param for the normal /api/:svc/* case.
+		svcRaw, _ := c.Get("svc")
+		svcStr, _ := svcRaw.(string)
+		if svcStr == "" {
+			svcStr = c.Param("svc")
+		}
 
 		var signingPath string
-		if svc != "" {
-			stripped, valid := proxy.UpstreamPathForSigning(rawPath, svc)
+		if svcStr != "" {
+			stripped, valid := proxy.UpstreamPathForSigning(rawPath, svcStr)
 			if !valid {
 				// Path contained null bytes / CRLF — already blocked by the proxy guard,
 				// but be defensive here too.
