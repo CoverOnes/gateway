@@ -150,6 +150,14 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 		registry.Forward(c, "user")
 	})
 
+	// Password reset — public (user not logged in), NoCache + authRL + bodyLimit.
+	authGroup.POST("/forgot-password", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+	authGroup.POST("/reset-password", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+
 	// OAuth social login routes (Increment 4) — public, authRL + NoCache apply via authGroup.
 	// GET  /v1/auth/oauth/:provider/start    — returns authorization URL (no auth required).
 	// GET  /v1/auth/oauth/:provider/callback — browser redirect target from provider.
