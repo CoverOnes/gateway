@@ -1182,3 +1182,156 @@ func TestProxy_CrossRepoLockstep_SignerPathMatchesVerifierPath(t *testing.T) {
 		})
 	}
 }
+
+// ─── CORS sole-authority: ModifyResponse strips upstream CORS headers ────────
+//
+// chat-gateway (and potentially other upstreams) run their own CORS middleware.
+// When the gateway proxies such a response, the upstream's CORS headers pass
+// through AND the gateway's own CORS middleware adds its own — producing
+// duplicate Access-Control-Allow-Origin values. Per the Fetch spec, duplicate
+// ACAO values cause the CORS check to fail, so the browser blocks the response.
+//
+// Fix: ModifyResponse now strips all upstream CORS and Vary headers before the
+// gateway middleware's CORS headers are written, making the gateway the sole
+// CORS authority for all proxied responses.
+
+// upstreamCORSHandler is a test upstream that sets its own CORS headers on
+// every response — simulating chat-gateway's independent CORS middleware.
+type upstreamCORSHandler struct {
+	origin string // the ACAO value the upstream sets (e.g. "https://app.coverones.com")
+	path   string // records the received path for assertion
+}
+
+func (u *upstreamCORSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	u.path = r.URL.Path
+	w.Header().Set("Access-Control-Allow-Origin", u.origin)
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, traceparent")
+	w.Header().Set("Access-Control-Max-Age", "7200")
+	w.Header().Set("Vary", "Origin")
+	w.WriteHeader(http.StatusOK)
+}
+
+// TestProxy_ModifyResponse_StripsUpstreamCORSHeaders verifies that when an
+// upstream sets its own CORS headers, ModifyResponse strips them all so only
+// the gateway middleware's single CORS header set survives.
+func TestProxy_ModifyResponse_StripsUpstreamCORSHeaders(t *testing.T) {
+	pub, priv, kid := generateEdDSAKey(t)
+
+	const allowedOrigin = "https://app.coverones.com"
+	corsUpstream := &upstreamCORSHandler{origin: allowedOrigin}
+	upstream := httptest.NewServer(corsUpstream)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	// Enable CORS on the gateway so the gateway middleware also sets ACAO.
+	routerCfg.CORSOrigins = []string{allowedOrigin}
+
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tokenStr := signTestToken(t, priv, kid, "user-cors-test")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/user/v1/me", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	req.Header.Set("Origin", allowedOrigin)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// The Fetch spec (and Go's http.Header.Get) returns the first value of a
+	// multi-value header. If the upstream's ACAO survived, the response would have
+	// TWO values for Access-Control-Allow-Origin — which browsers treat as a CORS
+	// failure. Assert there is exactly one value.
+	acao := w.Result().Header["Access-Control-Allow-Origin"]
+	require.Len(t, acao, 1,
+		"must have exactly one Access-Control-Allow-Origin value (upstream header must be stripped): got %v", acao)
+	assert.Equal(t, allowedOrigin, acao[0],
+		"the surviving ACAO value must be the one set by the gateway CORS middleware")
+
+	// Vary: Origin is set by the gateway middleware after ModifyResponse strips it.
+	vary := w.Result().Header["Vary"]
+	require.Len(t, vary, 1,
+		"must have exactly one Vary header after strip+re-add by gateway middleware: got %v", vary)
+	assert.Equal(t, "Origin", vary[0])
+}
+
+// TestProxy_ModifyResponse_StripsUpstreamCORSHeaders_NoGatewayCORS verifies
+// that when the gateway has no CORSOrigins configured (e.g. CDN handles CORS),
+// ModifyResponse still strips upstream CORS headers so that no CORS headers
+// reach the browser — correct for a CDN-fronted deployment.
+func TestProxy_ModifyResponse_StripsUpstreamCORSHeaders_NoGatewayCORS(t *testing.T) {
+	pub, priv, kid := generateEdDSAKey(t)
+
+	const allowedOrigin = "https://app.coverones.com"
+	corsUpstream := &upstreamCORSHandler{origin: allowedOrigin}
+	upstream := httptest.NewServer(corsUpstream)
+	defer upstream.Close()
+
+	// No CORSOrigins → gateway CORS middleware is NOT installed.
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tokenStr := signTestToken(t, priv, kid, "user-cors-no-gw-test")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/user/v1/me", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	req.Header.Set("Origin", allowedOrigin)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// When the gateway has no CORS middleware, upstream CORS headers must be stripped
+	// and NOT re-added by the gateway — the CDN layer provides CORS in production.
+	assert.Empty(t, w.Result().Header["Access-Control-Allow-Origin"],
+		"upstream ACAO must be stripped; no gateway CORS middleware is adding it back")
+	assert.Empty(t, w.Result().Header["Vary"],
+		"upstream Vary must be stripped; no gateway CORS middleware is adding it back")
+}
+
+// TestProxy_ModifyResponse_SecurityHeadersStillSet verifies that the CORS strip
+// does not inadvertently remove non-CORS security headers (regression guard).
+func TestProxy_ModifyResponse_SecurityHeadersStillSet(t *testing.T) {
+	pub, priv, kid := generateEdDSAKey(t)
+
+	corsUpstream := &upstreamCORSHandler{origin: "https://app.coverones.com"}
+	upstream := httptest.NewServer(corsUpstream)
+	defer upstream.Close()
+
+	routerCfg := buildRouter(t, pub, kid, upstream.URL)
+	r, err := handler.NewRouter(routerCfg)
+	require.NoError(t, err)
+
+	tokenStr := signTestToken(t, priv, kid, "user-secheader-test")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/user/v1/me", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	assert.Equal(t, "max-age=63072000; includeSubDomains; preload",
+		w.Header().Get("Strict-Transport-Security"),
+		"HSTS header must survive the CORS strip")
+	assert.Equal(t, "nosniff",
+		w.Header().Get("X-Content-Type-Options"),
+		"X-Content-Type-Options must survive the CORS strip")
+	assert.Equal(t, "DENY",
+		w.Header().Get("X-Frame-Options"),
+		"X-Frame-Options must survive the CORS strip")
+	assert.Equal(t, "no-referrer",
+		w.Header().Get("Referrer-Policy"),
+		"Referrer-Policy must survive the CORS strip")
+	assert.Equal(t, "default-src 'none'",
+		w.Header().Get("Content-Security-Policy"),
+		"CSP must survive the CORS strip")
+}
