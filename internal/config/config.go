@@ -4,8 +4,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
@@ -47,6 +50,14 @@ type Config struct {
 	// Empty string disables CORS headers (production: CDN handles it).
 	CORSOrigins string `mapstructure:"cors_origins"` // GATEWAY_CORS_ORIGINS
 
+	// TrustedProxyCIDR is an optional comma-separated list of CIDR blocks for trusted
+	// reverse proxies (e.g. "10.0.0.0/8,172.16.0.0/12"). When set, Gin calls
+	// SetTrustedProxies with the parsed list so that ClientIP correctly reads the
+	// real client IP from X-Forwarded-For instead of the LB IP.
+	// Empty (default) keeps the current behavior: SetTrustedProxies(nil) — all
+	// proxy trust is disabled, c.ClientIP() returns the direct connection IP.
+	TrustedProxyCIDR string `mapstructure:"trusted_proxy_cidr"` // GATEWAY_TRUSTED_PROXY_CIDR
+
 	// Rate limiting
 	RateLimitPerMin     int `mapstructure:"rate_limit_per_min"`      // GATEWAY_RATE_LIMIT_PER_MIN
 	AuthRateLimitPerMin int `mapstructure:"auth_rate_limit_per_min"` // GATEWAY_AUTH_RATE_LIMIT_PER_MIN
@@ -59,7 +70,21 @@ type Config struct {
 
 // Load reads configuration from environment variables (prefix GATEWAY_ and USER_).
 // Fail-fast at boot: returns an error if any required key is missing or invalid.
+//
+// Optional .env file loading: .env.local is loaded first (local developer overrides),
+// then .env (shared baseline). Both are optional — Load() does not fail when either
+// file is absent. godotenv.Load does NOT override variables that are already set in
+// the process environment, so compose-injected env vars always win over file values.
+// .env.example is intentionally NOT loaded (it is a template only, never a runtime file).
 func Load() (*Config, error) {
+	// Load optional env files before viper reads from the environment.
+	// Errors are intentionally ignored — files are optional and absence is normal
+	// in prod/staging where env vars are injected by the platform.
+	// godotenv.Load does NOT override variables already set in the environment,
+	// so compose-injected or platform-injected vars always win over file values.
+	_ = godotenv.Load(".env.local")
+	_ = godotenv.Load(".env")
+
 	v := viper.New()
 
 	// ENV-FIRST: set prefix and auto-bind env vars.
@@ -82,6 +107,7 @@ func Load() (*Config, error) {
 		"hmac_secret":             "GATEWAY_HMAC_SECRET",
 		"upstreams":               "GATEWAY_UPSTREAMS",
 		"cors_origins":            "GATEWAY_CORS_ORIGINS",
+		"trusted_proxy_cidr":      "GATEWAY_TRUSTED_PROXY_CIDR",
 		"rate_limit_per_min":      "GATEWAY_RATE_LIMIT_PER_MIN",
 		"auth_rate_limit_per_min": "GATEWAY_AUTH_RATE_LIMIT_PER_MIN",
 		"user_rate_limit_per_min": "GATEWAY_USER_RATE_LIMIT_PER_MIN",
@@ -154,6 +180,8 @@ func (c *Config) validate() error {
 
 	if c.JWKSUserURL == "" {
 		errs = append(errs, "USER_JWKS_URL is required")
+	} else {
+		errs = append(errs, c.validateJWKSURL()...)
 	}
 
 	if c.UserUpstreamURL == "" {
@@ -194,6 +222,7 @@ func (c *Config) validate() error {
 	}
 
 	errs = append(errs, c.validateHMACSecret()...)
+	errs = append(errs, c.validateTrustedProxyCIDR()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -223,7 +252,88 @@ func (c *Config) validateHMACSecret() []string {
 	return nil
 }
 
+// validateJWKSURL checks that USER_JWKS_URL has an http/https scheme and is not an
+// SSRF-dangerous IP literal. This mirrors the same check applied to proxy upstream URLs
+// in ParseRouteTable so the JWKS fetcher and the proxy have symmetric SSRF posture.
+func (c *Config) validateJWKSURL() []string {
+	parsed, err := parseSchemeAndHost(c.JWKSUserURL)
+	if err != nil {
+		return []string{fmt.Sprintf("USER_JWKS_URL is invalid: %s", err)}
+	}
+
+	// SSRF guard: same forbidden-range check as proxy upstreams, using non-dev = !IsDev().
+	if err := checkSSRF(parsed, !c.IsDev()); err != nil {
+		return []string{fmt.Sprintf("USER_JWKS_URL SSRF guard: %s", err)}
+	}
+
+	return nil
+}
+
+// parseSchemeAndHost parses rawURL and validates it has an http/https scheme and non-empty host.
+func parseSchemeAndHost(rawURL string) (*url.URL, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme %q (only http/https allowed)", parsed.Scheme)
+	}
+
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("empty host")
+	}
+
+	return parsed, nil
+}
+
 // IsDev reports whether the service is running in development mode.
 func (c *Config) IsDev() bool {
 	return strings.EqualFold(c.Env, "development")
+}
+
+// ValidateTrustedProxyCIDRs parses and returns the CIDR blocks from TrustedProxyCIDR.
+// Returns nil, nil when the field is empty (disabled).
+// Returns a validation error if any entry is not a valid CIDR.
+func (c *Config) ValidateTrustedProxyCIDRs() ([]string, error) {
+	if c.TrustedProxyCIDR == "" {
+		return nil, nil
+	}
+
+	var cidrs []string
+
+	for _, raw := range strings.Split(c.TrustedProxyCIDR, ",") {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		// Validate by attempting to parse. net.ParseCIDR is not imported here;
+		// use net/netip.ParsePrefix for consistency with the SSRF guard.
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("GATEWAY_TRUSTED_PROXY_CIDR contains invalid CIDR %q: %w", s, err)
+		}
+
+		// Reject whole-address-space CIDRs (0.0.0.0/0, ::/0).
+		// Trusting every IP as a proxy means any client can forge X-Forwarded-For,
+		// making c.ClientIP() fully attacker-controlled and bypassing IP rate limiting.
+		if p.Bits() == 0 {
+			return nil, fmt.Errorf("GATEWAY_TRUSTED_PROXY_CIDR %q covers the entire address space; use a specific LB egress CIDR", s)
+		}
+
+		cidrs = append(cidrs, s)
+	}
+
+	return cidrs, nil
+}
+
+// validateTrustedProxyCIDR validates GATEWAY_TRUSTED_PROXY_CIDR and appends any
+// error message to the provided slice. Called from validate().
+func (c *Config) validateTrustedProxyCIDR() []string {
+	if _, err := c.ValidateTrustedProxyCIDRs(); err != nil {
+		return []string{err.Error()}
+	}
+
+	return nil
 }

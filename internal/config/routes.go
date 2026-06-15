@@ -67,10 +67,15 @@ func ParseRouteTable(cfg *Config) (RouteTable, error) {
 // are blocked in ALL environments. Loopback (127.0.0.0/8, ::1/128) is blocked in
 // production only (allowed in development so local integration tests can run).
 var (
-	// Always-forbidden ranges (link-local / cloud metadata).
+	// Always-forbidden ranges (link-local / cloud metadata / any-address).
 	alwaysForbidden = []netip.Prefix{
 		netip.MustParsePrefix("169.254.0.0/16"), // IPv4 link-local incl. 169.254.169.254
 		netip.MustParsePrefix("fe80::/10"),      // IPv6 link-local
+		// M3 — SSRF any-address: 0.0.0.0 and :: bind to all interfaces; an upstream
+		// pointing there would reach whatever service happens to listen on the port,
+		// identical in risk to the loopback SSRF class.  Block in all environments.
+		netip.MustParsePrefix("0.0.0.0/32"), // IPv4 any-address (INADDR_ANY)
+		netip.MustParsePrefix("::/128"),     // IPv6 any-address (IN6ADDR_ANY)
 	}
 
 	// Loopback ranges — forbidden in production, allowed in development.
@@ -83,8 +88,8 @@ var (
 // checkSSRF returns an error if the upstream URL host is an IP literal that falls
 // into a forbidden range. Hostnames are always allowed (internal services legitimately
 // live on private RFC-1918 ranges that are accessed via DNS).
-// isProduction should be true when GATEWAY_ENV == "production".
-func checkSSRF(parsedURL *url.URL, isProduction bool) error {
+// isNonDev should be true when GATEWAY_ENV != "development" (i.e. staging or production).
+func checkSSRF(parsedURL *url.URL, isNonDev bool) error {
 	// Extract the host without port.
 	host := parsedURL.Hostname()
 
@@ -107,11 +112,12 @@ func checkSSRF(parsedURL *url.URL, isProduction bool) error {
 		}
 	}
 
-	// In production, loopback is also forbidden.
-	if isProduction {
+	// In non-dev environments, loopback is also forbidden: staging and production must
+	// not resolve to the loopback interface (consistent with the HMAC and other non-dev gates).
+	if isNonDev {
 		for _, prefix := range loopbackRanges {
 			if prefix.Contains(addr) {
-				return fmt.Errorf("upstream host %q is in forbidden loopback range %s (not allowed in production)", host, prefix)
+				return fmt.Errorf("upstream host %q is in forbidden loopback range %s (not allowed in non-dev)", host, prefix)
 			}
 		}
 	}

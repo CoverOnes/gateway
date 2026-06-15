@@ -1,12 +1,14 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,20 +67,6 @@ func mintToken(t *testing.T, priv ed25519.PrivateKey, kid, subject string) strin
 func upstreamStub(t *testing.T) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
-
-// recordingUpstreamStub starts an httptest server that records the exact path
-// forwarded to it (the gateway must preserve /v1/auth/... paths verbatim for the
-// user upstream). The last forwarded path is written to *gotPath. It replies 200
-// to any request so the test can assert routing without provider integration.
-func recordingUpstreamStub(t *testing.T, gotPath *string) string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		*gotPath = r.URL.Path
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
@@ -193,6 +181,374 @@ func TestLogoutNotGatedByAuthRL(t *testing.T) {
 	assert.NotEqual(t, http.StatusTooManyRequests, logoutCode,
 		"logout must NOT be blocked when authRL is depleted but ipRL has recovered (logout is outside authGroup)")
 }
+
+// ─── TestNewRouterFromConfig_WildcardCORSOriginDropped ──────────────────────
+
+// TestNewRouterFromConfig_WildcardCORSOriginDropped proves that when GATEWAY_CORS_ORIGINS
+// contains only wildcard/null entries, they are silently dropped so the gateway starts
+// without CORS headers rather than enabling an unsafe CWE-942 configuration.
+func TestNewRouterFromConfig_WildcardCORSOriginDropped(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	tests := []struct {
+		name        string
+		corsOrigins []string // fed directly into RouterConfig (already parsed by NewRouterFromConfig)
+	}{
+		{
+			name:        "nil origins → CORS disabled",
+			corsOrigins: nil,
+		},
+		{
+			name:        "empty slice → CORS disabled",
+			corsOrigins: []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pub, _ := generateEdDSAKey(t)
+			resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+			verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+			r, err := handler.NewRouter(&handler.RouterConfig{
+				Verifier:            verifier,
+				JWKSCache:           nil,
+				RouteTable:          table,
+				ProxyTimeout:        5,
+				RateLimitPerMin:     100_000,
+				AuthRateLimitPerMin: 100_000,
+				UserRateLimitPerMin: 100_000,
+				UserRateLimitBurst:  100_000,
+				CORSOrigins:         tc.corsOrigins,
+				HMACSecret:          nil,
+			})
+			require.NoError(t, err)
+
+			// OPTIONS preflight on an auth route — must NOT get Access-Control-Allow-Origin
+			// when CORS is disabled (no origins configured).
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				http.MethodOptions,
+				"/v1/auth/login",
+				http.NoBody,
+			)
+			req.Header.Set("Origin", "https://evil.example.com")
+			req.Header.Set("Access-Control-Request-Method", "POST")
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Empty(t, w.Header().Get("Access-Control-Allow-Origin"),
+				"Access-Control-Allow-Origin must be absent when no safe origins are configured; case: %q", tc.name)
+		})
+	}
+}
+
+// ─── TestBodyLimit_AuthRoute413 ───────────────────────────────────────────────
+
+// TestBodyLimit_AuthRoute413 verifies that /v1/auth/* routes enforce a 64 KiB
+// body limit and return 413 REQUEST_ENTITY_TOO_LARGE for oversized payloads.
+// This covers the re-review Major finding: no request body size limit on auth routes.
+func TestBodyLimit_AuthRoute413(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// 64 KiB + 1 byte exceeds the auth body limit (64 KiB).
+	oversized := bytes.Repeat([]byte("a"), 64*1024+1)
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/auth/login",
+		bytes.NewReader(oversized),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code,
+		"oversized auth body must return 413 REQUEST_ENTITY_TOO_LARGE")
+	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
+		"413 body must contain machine-readable error code")
+}
+
+// ─── TestBodyLimit_APIRouteSmallPayloadOK ────────────────────────────────────
+
+// TestBodyLimit_APIRouteSmallPayloadOK verifies that the 10 MiB limit on /api/*
+// does not reject legitimate requests below the threshold.
+func TestBodyLimit_APIRouteSmallPayloadOK(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	const kid = "body-limit-test-kid"
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+
+	upstream := upstreamStub(t)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	r, routerErr := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, routerErr)
+
+	token := mintToken(t, priv, kid, "user-body-limit-ok")
+
+	smallBody := strings.NewReader(`{"key":"value"}`)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/user/v1/profile", smallBody)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code,
+		"small API payload must not be rejected by body limit middleware")
+}
+
+// ─── TestTrustedProxyCIDR_InvalidRejected ────────────────────────────────────
+
+// TestTrustedProxyCIDR_InvalidRejected verifies that invalid or dangerous CIDRs in
+// GATEWAY_TRUSTED_PROXY_CIDR are rejected at boot — preventing X-Forwarded-For spoofing
+// that would bypass IP rate limiting.
+func TestTrustedProxyCIDR_InvalidRejected(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		errContains string
+	}{
+		{
+			name:        "non-CIDR string is rejected",
+			input:       "not-a-cidr",
+			errContains: "not-a-cidr",
+		},
+		{
+			name:        "IPv4 whole-address-space 0.0.0.0/0 is rejected",
+			input:       "0.0.0.0/0",
+			errContains: "entire address space",
+		},
+		{
+			name:        "IPv6 whole-address-space ::/0 is rejected",
+			input:       "::/0",
+			errContains: "entire address space",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{TrustedProxyCIDR: tc.input}
+			_, err := cfg.ValidateTrustedProxyCIDRs()
+			require.Error(t, err, "dangerous/invalid CIDR must be rejected")
+			assert.Contains(t, err.Error(), tc.errContains)
+		})
+	}
+}
+
+// TestTrustedProxyCIDR_ValidParsed verifies that valid CIDRs are parsed correctly.
+func TestTrustedProxyCIDR_ValidParsed(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantLen int
+		wantNil bool
+	}{
+		{
+			name:    "empty string → nil (disabled)",
+			input:   "",
+			wantNil: true,
+		},
+		{
+			name:    "single CIDR",
+			input:   "10.0.0.0/8",
+			wantLen: 1,
+		},
+		{
+			name:    "multiple CIDRs",
+			input:   "10.0.0.0/8,172.16.0.0/12",
+			wantLen: 2,
+		},
+		{
+			name:    "CIDRs with spaces",
+			input:   "10.0.0.0/8, 172.16.0.0/12",
+			wantLen: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{TrustedProxyCIDR: tc.input}
+			cidrs, err := cfg.ValidateTrustedProxyCIDRs()
+			require.NoError(t, err)
+			if tc.wantNil {
+				assert.Nil(t, cidrs)
+			} else {
+				assert.Len(t, cidrs, tc.wantLen)
+			}
+		})
+	}
+}
+
+// ─── TestRateLimiter_RetryAfterHeader ─────────────────────────────────────────
+
+// TestRateLimiter_RetryAfterHeader verifies that 429 responses include the
+// Retry-After header so clients know when to retry.
+func TestRateLimiter_RetryAfterHeader(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	// Build router with rate limit of 1/min burst=1 so it exhausts immediately.
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     1,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// Exhaust the IP rate limit (burst=10 for IP RL).
+	var got429 bool
+	var retryAfter string
+
+	for range 15 {
+		req := httptest.NewRequestWithContext(
+			context.Background(),
+			http.MethodPost,
+			"/v1/auth/login",
+			http.NoBody,
+		)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code == http.StatusTooManyRequests {
+			got429 = true
+			retryAfter = w.Header().Get("Retry-After")
+
+			break
+		}
+	}
+
+	require.True(t, got429, "expected a 429 after exhausting rate limit")
+	assert.NotEmpty(t, retryAfter, "429 response must include Retry-After header")
+}
+
+// ─── TestBodyLimit_LogoutRoute413 ────────────────────────────────────────────
+
+// TestBodyLimit_LogoutRoute413 verifies that /v1/auth/logout enforces the 64 KiB
+// body limit. Logout is registered outside authGroup (intentionally, to avoid the
+// IP-keyed authRL limiter) so the body limit must be added explicitly to its chain.
+// This covers the re-review Minor finding: logout had no body limit.
+//
+// bodyLimitMiddleware wraps the body with http.MaxBytesReader but does not read eagerly;
+// the limit fires when the proxy reads the body. authMW reads only the Authorization
+// header, so a valid JWT is required to reach the proxy and trigger the 413.
+func TestBodyLimit_LogoutRoute413(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	pub, priv := generateEdDSAKey(t)
+	const kid = "logout-limit-kid"
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	table := config.RouteTable{
+		"user": config.UpstreamEntry{BaseURL: upstream},
+	}
+
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// 64 KiB + 1 byte exceeds the auth body limit (64 KiB).
+	oversized := bytes.Repeat([]byte("a"), 64*1024+1)
+
+	token := mintToken(t, priv, kid, "test-logout-limit-user")
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/auth/logout",
+		bytes.NewReader(oversized),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code,
+		"oversized logout body must return 413 REQUEST_ENTITY_TOO_LARGE")
+	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
+		"413 body must contain machine-readable error code")
+}
+
+func recordingUpstreamStub(t *testing.T, gotPath *string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// newTestRouterWithIPRL builds a RouterConfig with explicit ipRLPerMin control.
+// Use this when the test needs ipRL to refill at a specific rate (differential-refill tests).
 
 // ─── TestOAuthRoutesArePublic ─────────────────────────────────────────────────
 

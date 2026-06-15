@@ -12,10 +12,14 @@ import (
 // loopback-blocking tests. Defined as a constant to satisfy goconst.
 const loopbackUpstream = "local=http://127.0.0.1:8080"
 
+// envDevelopment is the development environment string used across multiple tests.
+// Extracted as a constant to satisfy goconst (4 occurrences).
+const envDevelopment = "development"
+
 func baseConfig() *config.Config {
 	return &config.Config{
 		Port:                8080,
-		Env:                 "development",
+		Env:                 envDevelopment,
 		LogLevel:            "INFO",
 		JWKSUserURL:         "http://user:8080/jwks",
 		JWKSCacheTTLSec:     300,
@@ -203,12 +207,61 @@ func TestParseRouteTable_RejectLoopbackInProduction(t *testing.T) {
 
 func TestParseRouteTable_AllowLoopbackInDevelopment(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Env = "development"
+	cfg.Env = envDevelopment
 	cfg.Upstreams = loopbackUpstream
 
 	table, err := config.ParseRouteTable(cfg)
 	require.NoError(t, err, "loopback must be allowed in development for local integration tests")
 	assert.Contains(t, table, "local")
+}
+
+// ─── M3 — SSRF any-address tests ──────────────────────────────────────────────
+
+// TestParseRouteTable_RejectIPv4AnyAddress asserts that 0.0.0.0 (INADDR_ANY) is
+// rejected in all environments. An upstream pointing there binds to whatever service
+// listens on the port — equivalent risk to the loopback SSRF class.
+func TestParseRouteTable_RejectIPv4AnyAddress(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Upstreams = "evil=http://0.0.0.0:8080"
+
+	_, err := config.ParseRouteTable(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forbidden range", "0.0.0.0 (IPv4 any-address) must be rejected in all environments")
+}
+
+// TestParseRouteTable_RejectIPv4AnyAddressInDevelopment asserts that 0.0.0.0 is
+// rejected even in development (unlike loopback which is allowed in dev).
+func TestParseRouteTable_RejectIPv4AnyAddressInDevelopment(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Env = envDevelopment
+	cfg.Upstreams = "evil=http://0.0.0.0:9090"
+
+	_, err := config.ParseRouteTable(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forbidden range", "0.0.0.0 must be rejected even in development")
+}
+
+// TestParseRouteTable_RejectIPv6AnyAddress asserts that :: (IN6ADDR_ANY) is
+// rejected in all environments.
+func TestParseRouteTable_RejectIPv6AnyAddress(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Upstreams = "evil=http://[::]:8080"
+
+	_, err := config.ParseRouteTable(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forbidden range", ":: (IPv6 any-address) must be rejected in all environments")
+}
+
+// TestParseRouteTable_RejectIPv6AnyAddressInDevelopment asserts that :: is rejected
+// even in development.
+func TestParseRouteTable_RejectIPv6AnyAddressInDevelopment(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Env = envDevelopment
+	cfg.Upstreams = "evil=http://[::]:9090"
+
+	_, err := config.ParseRouteTable(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "forbidden range", ":: must be rejected even in development")
 }
 
 // TestParseRouteTable_RejectLoopbackInStaging asserts staging gets prod-grade loopback

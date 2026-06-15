@@ -51,43 +51,6 @@ func Auth(verifier *jwt.Verifier) gin.HandlerFunc {
 	}
 }
 
-// RequireTier returns a middleware that enforces a minimum KYC tier.
-// Must be registered after Auth middleware.
-func RequireTier(minTier int16) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		raw, ok := c.Get(ctxKeyClaims)
-		if !ok {
-			c.Abort()
-			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
-
-			return
-		}
-
-		claims, ok := raw.(*jwt.Claims)
-		if !ok {
-			c.Abort()
-			httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
-
-			return
-		}
-
-		if claims.KYCTier < minTier {
-			c.Abort()
-			httpx.ErrCode(
-				c, http.StatusForbidden, "KYC_TIER_REQUIRED", "kyc verification required",
-				gin.H{
-					"requiredTier": minTier,
-					"currentTier":  claims.KYCTier,
-				},
-			)
-
-			return
-		}
-
-		c.Next()
-	}
-}
-
 // ClaimsFromCtx extracts the JWT claims set by the Auth middleware.
 func ClaimsFromCtx(c *gin.Context) (*jwt.Claims, bool) {
 	raw, ok := c.Get(ctxKeyClaims)

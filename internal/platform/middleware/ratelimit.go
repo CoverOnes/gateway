@@ -94,11 +94,13 @@ func (l *IPRateLimiter) allow(key string) bool {
 
 // Handler returns the Gin middleware function.
 // Fail-closed: over-limit always returns 429 RATE_LIMITED.
+// Retry-After: 60 is set to indicate the approximate token-bucket refill window.
 func (l *IPRateLimiter) Handler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := l.keyFunc(c)
 		if !l.allow(key) {
 			c.Abort()
+			c.Header("Retry-After", "60")
 			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
 
 			return
@@ -174,11 +176,13 @@ func userKey(c *gin.Context) string {
 
 // Handler returns the Gin middleware function.
 // Fail-closed: over-limit always returns 429 RATE_LIMITED.
+// Retry-After: 60 is set to indicate the approximate token-bucket refill window.
 func (l *UserRateLimiter) Handler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := userKey(c)
 		if !l.allow(key) {
 			c.Abort()
+			c.Header("Retry-After", "60")
 			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
 
 			return

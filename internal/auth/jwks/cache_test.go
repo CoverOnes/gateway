@@ -188,6 +188,71 @@ func TestCache_UnknownKidAfterRefreshReturnsNil(t *testing.T) {
 	assert.Nil(t, got, "unknown kid should return nil after re-fetch")
 }
 
+// TestCache_CrossHostRedirectIsRejected verifies that a JWKS endpoint that issues
+// a 302 redirect to a different host is refused. This guards against SSRF via a
+// compromised/misconfigured JWKS server that redirects to a cloud-metadata service
+// (e.g. 169.254.169.254) or any other cross-host destination.
+func TestCache_CrossHostRedirectIsRejected(t *testing.T) {
+	// Forbidden target: any host that differs from the original JWKS server.
+	// We use a second httptest server as the "forbidden" redirect destination.
+	forbidden := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// This handler must never be reached; if it is, the test fails below.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	defer forbidden.Close()
+
+	// JWKS server that always issues a 302 to the forbidden host.
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.Redirect(w, req, forbidden.URL+"/jwks", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	cache := jwks.NewCache(redirector.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	// The redirect to a different host must be rejected; the cache must NOT be ready.
+	assert.False(t, cache.Ready(),
+		"cache must not be ready when JWKS endpoint redirects to a cross-host destination")
+}
+
+// TestCache_SameHostRedirectIsAllowed verifies that a JWKS server issuing a
+// same-host redirect (e.g. HTTP→HTTPS upgrade or path normalization) is followed.
+func TestCache_SameHostRedirectIsAllowed(t *testing.T) {
+	_, kid, x := generateKey(t)
+
+	// We need a test server that responds to two paths on the same host:
+	// GET / → 302 to /jwks (same host)
+	// GET /jwks → real JWKS
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/jwks", http.StatusFound)
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		payload, err := json.Marshal(authjwt.JWKS{Keys: []authjwt.JWKSKey{
+			{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid, X: x},
+		}})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(payload)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Point cache at the root path which redirects to /jwks on the same host.
+	cache := jwks.NewCache(srv.URL+"/", 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	assert.True(t, cache.Ready(),
+		"cache must be ready after following a same-host redirect")
+}
+
 // TestCache_SingleFlightReusesLeaderFetch verifies that when many goroutines
 // concurrently look up the same unknown kid, only the single-flight leader
 // performs an upstream GET; the woken waiters re-check the cache and reuse the

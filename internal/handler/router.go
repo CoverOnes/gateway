@@ -3,6 +3,7 @@ package handler
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -14,6 +15,15 @@ import (
 	"github.com/CoverOnes/gateway/internal/proxy"
 	"github.com/gin-gonic/gin"
 )
+
+// bodyLimitAPI is the maximum request body size for /api/* proxy routes (10 MiB).
+// Upstream services can enforce tighter limits per-endpoint; this guards the gateway.
+const bodyLimitAPI = 10 << 20 // 10 MiB
+
+// bodyLimitAuth is the maximum request body size for /v1/auth/* routes (64 KiB).
+// Auth payloads (login, register, refresh tokens) are always small JSON objects; a 64 KiB
+// limit prevents body-buffering DoS on the gateway before the upstream is ever reached.
+const bodyLimitAuth = 64 << 10 // 64 KiB
 
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
@@ -29,6 +39,11 @@ type RouterConfig struct {
 	// HMACSecret signs the gateway-origin identity tuple (CONVENTIONS §24).
 	// Empty → signing disabled (development only; non-dev config fails fast).
 	HMACSecret []byte
+	// TrustedProxyCIDRs is the parsed list from GATEWAY_TRUSTED_PROXY_CIDR.
+	// When non-nil, Gin calls SetTrustedProxies with these CIDRs so that
+	// ClientIP reads the real client IP from X-Forwarded-For.
+	// nil (default) → SetTrustedProxies(nil), all proxy trust disabled.
+	TrustedProxyCIDRs []string
 }
 
 // rateLimitOrDefault returns v if > 0, otherwise fallback.
@@ -58,7 +73,20 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
-	r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+
+	// Trusted proxy configuration — determines how ClientIP resolves the real client IP.
+	// When TrustedProxyCIDRs is set (production/staging behind a LB), Gin reads the real
+	// client IP from X-Forwarded-For so that per-IP rate limiting keys on the actual client
+	// instead of the shared LB egress IP.
+	// When nil (development / unset), all proxy trust is disabled: ClientIP returns the
+	// direct connection IP — safe for direct internet-facing deployments without an LB.
+	if len(cfg.TrustedProxyCIDRs) > 0 {
+		if err := r.SetTrustedProxies(cfg.TrustedProxyCIDRs); err != nil {
+			return nil, fmt.Errorf("set trusted proxies: %w", err)
+		}
+	} else {
+		r.SetTrustedProxies(nil) //nolint:errcheck // nil proxy list disables proxy trust; gin docs confirm error is always nil for nil argument
+	}
 
 	// CORS must be first — preflight OPTIONS must be handled before any other middleware
 	// (rate limiter, auth, etc.) can reject the request.
@@ -99,11 +127,12 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 		registry.Forward(c, "user")
 	})
 
-	// Public auth routes — no JWT, but NoCache + tighter rate limit.
+	// Public auth routes — no JWT, but NoCache + tighter rate limit + tight body limit.
 	authRL := middleware.NewAuthRateLimiter(rateLimitOrDefault(cfg.AuthRateLimitPerMin, 20))
 	authGroup := r.Group("/v1/auth")
 	authGroup.Use(middleware.NoCache())
 	authGroup.Use(authRL.Handler())
+	authGroup.Use(bodyLimitMiddleware(bodyLimitAuth))
 	authGroup.POST("/register", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
@@ -120,18 +149,42 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	authGroup.POST("/resend-verification", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
-	// OAuth social-login (Google OIDC + LINE v2.1) — browser-redirect GET routes.
-	// These ARE the auth flow: the user has no access token yet, so they stay public
-	// (NoCache + IP-keyed authRL only, no Auth middleware). The :provider slug
-	// (google/line) and validation live entirely in the user upstream; the gateway is
-	// a dumb proxy here and holds NO OAuth config. /start issues a 302 to the provider;
-	// the provider redirects the browser back to /callback (gateway-fronted).
+
+	// Password reset — public (user not logged in), NoCache + authRL + bodyLimit.
+	authGroup.POST("/forgot-password", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+	authGroup.POST("/reset-password", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+
+	// OAuth social login routes (Increment 4) — public, authRL + NoCache apply via authGroup.
+	// GET  /v1/auth/oauth/:provider/start    — returns authorization URL (no auth required).
+	// GET  /v1/auth/oauth/:provider/callback — browser redirect target from provider.
 	authGroup.GET("/oauth/:provider/start", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
 	authGroup.GET("/oauth/:provider/callback", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
+	// POST /v1/auth/oauth/register — completes the no-email registration flow (LINE without
+	// email scope: user supplies an email). authGroup applies authRL (registration deserves
+	// rate-limiting) + NoCache + bodyLimit.
+	authGroup.POST("/oauth/register", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+
+	// POST /v1/auth/oauth/exchange — consumes a one-time login code and returns a token pair.
+	// Intentionally outside authGroup (no authRL): the one-time code is single-use and
+	// short-lived; it is already the rate-limiting artifact. The IP-level ipRL still applies.
+	r.POST(
+		"/v1/auth/oauth/exchange",
+		middleware.NoCache(),
+		bodyLimitMiddleware(bodyLimitAuth),
+		func(c *gin.Context) {
+			registry.Forward(c, "user")
+		},
+	)
 
 	// Per-user rate limiter: keyed on JWT subject (user UUID).
 	// Placed AFTER Auth (which validates the JWT and injects claims) so the key is always
@@ -152,6 +205,7 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	r.POST(
 		"/v1/auth/logout",
 		middleware.NoCache(),
+		bodyLimitMiddleware(bodyLimitAuth),
 		authMW,
 		userRL.Handler(),
 		middleware.InjectIdentity(cfg.HMACSecret),
@@ -160,9 +214,42 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 		},
 	)
 
+	// Protected /v1/me proxy — Auth + PerUserRateLimit + InjectIdentity required.
+	// All routes under /v1/me (profile, sessions, OAuth bind/unbind) are forwarded to
+	// the user service. The middleware chain mirrors the /v1/me group in user/router.go.
+	me := r.Group("/v1/me")
+	me.Use(bodyLimitMiddleware(bodyLimitAPI))
+	me.Use(authMW)
+	me.Use(userRL.Handler())
+	me.Use(middleware.InjectIdentity(cfg.HMACSecret))
+	me.Any("/*proxyPath", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
+
+	// SSE stream route — scoped exception for browser EventSource which cannot send
+	// Authorization headers. Accepts JWT via access_token query param on this ONE route
+	// only. SSEAuth validates identically to Auth (same JWKS verifier + claim set).
+	// The access_token param is redacted from the URL before InjectIdentity so it is
+	// never logged and not included in the HMAC-signed path.
+	//
+	// SECURITY SCOPE RED-LINE: this pattern MUST NOT be copied to any other route.
+	// All other routes MUST use the Bearer Auth() middleware. See middleware.SSEAuth
+	// for the full security rationale.
+	r.GET(
+		"/api/chat/v1/messages/stream",
+		bodyLimitMiddleware(bodyLimitAPI),
+		middleware.SSEAuth(cfg.Verifier),
+		userRL.Handler(),
+		middleware.InjectIdentity(cfg.HMACSecret),
+		func(c *gin.Context) {
+			registry.Forward(c, "chat")
+		},
+	)
+
 	// Protected proxy routes — Auth + PerUserRateLimit + InjectIdentity required.
 	// /api/:svc/* pattern with allowlist-only forwarding.
 	api := r.Group("/api/:svc")
+	api.Use(bodyLimitMiddleware(bodyLimitAPI))
 	api.Use(authMW)
 	api.Use(userRL.Handler())
 	api.Use(middleware.InjectIdentity(cfg.HMACSecret))
@@ -196,6 +283,20 @@ func accessLogger() gin.HandlerFunc {
 	}
 }
 
+// bodyLimitMiddleware returns a Gin middleware that caps the request body to maxBytes.
+// When the body exceeds the limit, http.MaxBytesReader causes the downstream proxy
+// ErrorHandler to detect a *http.MaxBytesError and return 413 REQUEST_ENTITY_TOO_LARGE.
+// This prevents body-buffering DoS on both auth and proxy routes.
+func bodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		}
+
+		c.Next()
+	}
+}
+
 // NewRouterFromConfig builds a RouterConfig from a full app config and a JWKS cache.
 // This is the entrypoint used by cmd/server/main.go.
 func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine, error) {
@@ -225,6 +326,16 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		}
 	}
 
+	// Parse trusted proxy CIDRs — validated at boot by config.Load(), safe to ignore error here.
+	trustedProxyCIDRs, err := appCfg.ValidateTrustedProxyCIDRs()
+	if err != nil {
+		return nil, fmt.Errorf("trusted proxy CIDRs: %w", err)
+	}
+
+	if len(trustedProxyCIDRs) > 0 {
+		slog.Info("trusted proxy CIDRs configured", "cidrs", trustedProxyCIDRs)
+	}
+
 	r, err := NewRouter(&RouterConfig{
 		Verifier:            verifier,
 		JWKSCache:           cache,
@@ -236,6 +347,7 @@ func NewRouterFromConfig(appCfg *config.Config, cache *jwks.Cache) (*gin.Engine,
 		UserRateLimitBurst:  appCfg.UserRateLimitBurst,
 		CORSOrigins:         corsOrigins,
 		HMACSecret:          []byte(appCfg.HMACSecret),
+		TrustedProxyCIDRs:   trustedProxyCIDRs,
 	})
 	if err != nil {
 		return nil, err

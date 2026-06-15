@@ -269,3 +269,133 @@ func TestLoad_StagingWithoutHMACSecretFails(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "GATEWAY_HMAC_SECRET")
 }
+
+// ─── JWKS URL SSRF validation tests (Major finding 5) ─────────────────────────
+
+// TestLoad_JWKSURLLinkLocalRejected asserts that a link-local / cloud-metadata IP
+// in USER_JWKS_URL is rejected at boot to prevent SSRF via the JWKS fetcher.
+func TestLoad_JWKSURLLinkLocalRejected(t *testing.T) {
+	minValidEnv(t)
+	// 169.254.169.254 is the AWS/GCP metadata endpoint — always forbidden.
+	setEnv(t, "USER_JWKS_URL", "http://169.254.169.254/jwks")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_JWKS_URL")
+}
+
+// TestLoad_JWKSURLLoopbackRejectedInProd asserts that a loopback address in
+// USER_JWKS_URL is rejected in production (allowed in development).
+func TestLoad_JWKSURLLoopbackRejectedInProd(t *testing.T) {
+	minValidEnv(t)
+	setEnv(
+		t,
+		"GATEWAY_ENV", "production",
+		"GATEWAY_HMAC_SECRET", validProdSecret,
+		"USER_JWKS_URL", "http://127.0.0.1:8080/jwks",
+	)
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_JWKS_URL")
+}
+
+// TestLoad_JWKSURLLoopbackAllowedInDev asserts that loopback is allowed in
+// development (so local integration tests can run without modifying /etc/hosts).
+func TestLoad_JWKSURLLoopbackAllowedInDev(t *testing.T) {
+	minValidEnv(t)
+	// GATEWAY_ENV=development already set by minValidEnv.
+	setEnv(t, "USER_JWKS_URL", "http://127.0.0.1:8080/jwks")
+
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "http://127.0.0.1:8080/jwks", cfg.JWKSUserURL)
+}
+
+// TestLoad_JWKSURLUnsupportedSchemeRejected asserts that non-http/https schemes
+// in USER_JWKS_URL are rejected (e.g. file:// or ftp://).
+func TestLoad_JWKSURLUnsupportedSchemeRejected(t *testing.T) {
+	minValidEnv(t)
+	setEnv(t, "USER_JWKS_URL", "file:///etc/passwd")
+
+	_, err := config.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "USER_JWKS_URL")
+}
+
+// ─── ValidateTrustedProxyCIDRs ────────────────────────────────────────────────
+
+// TestValidateTrustedProxyCIDRs covers the whole-address-space rejection guard
+// introduced in the M1 security finding: 0.0.0.0/0 and ::/0 allow any client
+// to forge X-Forwarded-For, making c.ClientIP() fully attacker-controlled and
+// bypassing IP rate limiting.
+func TestValidateTrustedProxyCIDRs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cidr    string
+		wantErr string // non-empty → expect error containing this substring
+	}{
+		{
+			name:    "happy path single IPv4 CIDR",
+			cidr:    "10.0.0.0/8",
+			wantErr: "",
+		},
+		{
+			name:    "happy path multiple CIDRs",
+			cidr:    "10.0.0.0/8,172.16.0.0/12",
+			wantErr: "",
+		},
+		{
+			name:    "happy path IPv6 non-zero prefix",
+			cidr:    "2001:db8::/32",
+			wantErr: "",
+		},
+		{
+			name:    "empty field returns nil (disabled)",
+			cidr:    "",
+			wantErr: "",
+		},
+		{
+			name:    "invalid CIDR rejected",
+			cidr:    "not-a-cidr",
+			wantErr: "GATEWAY_TRUSTED_PROXY_CIDR",
+		},
+		// M1 guard: whole-address-space CIDRs must be rejected.
+		{
+			name:    "0.0.0.0/0 rejected — entire IPv4 space",
+			cidr:    "0.0.0.0/0",
+			wantErr: "covers the entire address space",
+		},
+		{
+			name:    "::/0 rejected — entire IPv6 space",
+			cidr:    "::/0",
+			wantErr: "covers the entire address space",
+		},
+		{
+			name:    "0.0.0.0/0 in mixed list rejected",
+			cidr:    "10.0.0.0/8,0.0.0.0/0",
+			wantErr: "covers the entire address space",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &config.Config{TrustedProxyCIDR: tc.cidr}
+			cidrs, err := cfg.ValidateTrustedProxyCIDRs()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				if tc.cidr == "" {
+					assert.Nil(t, cidrs)
+				} else {
+					assert.NotEmpty(t, cidrs)
+				}
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
