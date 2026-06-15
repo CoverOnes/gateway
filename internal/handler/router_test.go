@@ -73,6 +73,26 @@ func upstreamStub(t *testing.T) string {
 	return srv.URL
 }
 
+// recordingUpstreamServer starts an httptest server that records every incoming request path
+// and responds with the given statusCode. The last recorded path is accessible via lastPath.
+type recordingUpstreamServer struct {
+	lastPath string
+	srv      *httptest.Server
+}
+
+func newRecordingUpstreamServer(t *testing.T, statusCode int) *recordingUpstreamServer {
+	t.Helper()
+
+	stub := &recordingUpstreamServer{}
+	stub.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stub.lastPath = r.URL.Path
+		w.WriteHeader(statusCode)
+	}))
+	t.Cleanup(stub.srv.Close)
+
+	return stub
+}
+
 // newTestRouterWithIPRL builds a RouterConfig with explicit ipRLPerMin control.
 // Use this when the test needs ipRL to refill at a specific rate (differential-refill tests).
 func newTestRouterWithIPRL(
@@ -481,6 +501,100 @@ func TestRateLimiter_RetryAfterHeader(t *testing.T) {
 
 // ─── TestBodyLimit_LogoutRoute413 ────────────────────────────────────────────
 
+// ─── TestWaitlistRoute ────────────────────────────────────────────────────────
+
+// TestWaitlistRoute proves three properties of the POST /v1/waitlist route:
+//
+//	(a) It is reachable WITHOUT an Authorization header — the gateway must not return
+//	    401 or 404, confirming the route is public (no JWT middleware applied).
+//	(b) The path is forwarded verbatim to the notification upstream stub — the proxy
+//	    must not rewrite /v1/waitlist to any other path.
+//	(c) A non-POST method (GET) returns 404 — Gin's default when HandleMethodNotAllowed
+//	    is not enabled; the route is not a catch-all, only POST is registered.
+func TestWaitlistRoute(t *testing.T) {
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	stub := newRecordingUpstreamServer(t, http.StatusOK)
+
+	table := config.RouteTable{
+		"user":         config.UpstreamEntry{BaseURL: upstreamStub(t)},
+		"notification": config.UpstreamEntry{BaseURL: stub.srv.URL},
+	}
+
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name           string
+		method         string
+		bearerToken    string
+		wantStatus     int
+		wantPathSuffix string // non-empty → assert stub.lastPath ends with this
+		desc           string
+	}{
+		{
+			name:           "POST without Authorization is accepted (public route)",
+			method:         http.MethodPost,
+			bearerToken:    "",
+			wantStatus:     http.StatusOK,
+			wantPathSuffix: "/v1/waitlist",
+			desc:           "public endpoint must not require JWT; must not return 401 or 404",
+		},
+		{
+			name:        "GET method is not registered (404)",
+			method:      http.MethodGet,
+			bearerToken: "",
+			wantStatus:  http.StatusNotFound,
+			desc:        "only POST is registered; GET returns 404 (Gin default when HandleMethodNotAllowed is not set)",
+		},
+		{
+			name:           "POST with Authorization header still works (token ignored)",
+			method:         http.MethodPost,
+			bearerToken:    "some-irrelevant-token",
+			wantStatus:     http.StatusOK,
+			wantPathSuffix: "/v1/waitlist",
+			desc:           "presence of an Authorization header must not affect a public route",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(
+				context.Background(),
+				tc.method,
+				"/v1/waitlist",
+				strings.NewReader(`{"email":"test@example.com"}`),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			if tc.bearerToken != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.bearerToken)
+			}
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, tc.wantStatus, w.Code, tc.desc)
+
+			if tc.wantPathSuffix != "" {
+				assert.Equal(t, tc.wantPathSuffix, stub.lastPath,
+					"proxy must forward path verbatim to notification upstream")
+			}
+		})
+	}
+}
+
 // TestBodyLimit_LogoutRoute413 verifies that /v1/auth/logout enforces the 64 KiB
 // body limit. Logout is registered outside authGroup (intentionally, to avoid the
 // IP-keyed authRL limiter) so the body limit must be added explicitly to its chain.
@@ -535,6 +649,53 @@ func TestBodyLimit_LogoutRoute413(t *testing.T) {
 		"oversized logout body must return 413 REQUEST_ENTITY_TOO_LARGE")
 	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
 		"413 body must contain machine-readable error code")
+}
+
+func TestBodyLimit_WaitlistRoute413(t *testing.T) {
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	stub := newRecordingUpstreamServer(t, http.StatusOK)
+
+	table := config.RouteTable{
+		"notification": config.UpstreamEntry{BaseURL: stub.srv.URL},
+	}
+
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// 8 KiB + 1 byte exceeds the waitlist body limit (8 KiB).
+	oversized := bytes.Repeat([]byte("a"), 8*1024+1)
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/waitlist",
+		bytes.NewReader(oversized),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code,
+		"oversized waitlist body must return 413 REQUEST_ENTITY_TOO_LARGE")
+	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
+		"413 body must contain machine-readable error code")
+	// Note: MaxBytesReader is a streaming limit — the reverse proxy may have already
+	// forwarded the request line before the body-read trips the limit, so we assert the
+	// client-facing 413 contract (matching TestBodyLimit_LogoutRoute413), not upstream reach.
 }
 
 func recordingUpstreamStub(t *testing.T, gotPath *string) string {

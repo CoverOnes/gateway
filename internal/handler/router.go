@@ -25,6 +25,11 @@ const bodyLimitAPI = 10 << 20 // 10 MiB
 // limit prevents body-buffering DoS on the gateway before the upstream is ever reached.
 const bodyLimitAuth = 64 << 10 // 64 KiB
 
+// bodyLimitWaitlist is the maximum request body size for POST /v1/waitlist (8 KiB).
+// Waitlist payloads are small JSON objects (email + optional name); 8 KiB prevents
+// body-buffering DoS on this public unauthenticated endpoint.
+const bodyLimitWaitlist = 8 << 10 // 8 KiB
+
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
 	Verifier            *jwt.Verifier
@@ -126,6 +131,25 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	r.GET("/jwks", func(c *gin.Context) {
 		registry.Forward(c, "user")
 	})
+
+	// Public waitlist capture — POST /v1/waitlist → notification upstream.
+	// No JWT required. Global ipRL (registered above with r.Use) already applies.
+	// NoCache prevents CDN/proxy from caching the write response.
+	// bodyLimitWaitlist (8 KiB) guards against body-buffering DoS on this
+	// unauthenticated write endpoint before the upstream is reached.
+	// The gateway ipRL above is the effective per-IP gate for this route. The notification
+	// service also applies a 5/min limiter, but it currently keys on the gateway egress IP
+	// (notification SetTrustedProxies(nil)), so it degrades to a per-gateway global gate —
+	// real per-client limiting there is pending notification trusted-proxy config (tracked
+	// separately, see the ClientIP trust-chain task).
+	r.POST(
+		"/v1/waitlist",
+		middleware.NoCache(),
+		bodyLimitMiddleware(bodyLimitWaitlist),
+		func(c *gin.Context) {
+			registry.Forward(c, "notification")
+		},
+	)
 
 	// Public auth routes — no JWT, but NoCache + tighter rate limit + tight body limit.
 	authRL := middleware.NewAuthRateLimiter(rateLimitOrDefault(cfg.AuthRateLimitPerMin, 20))
