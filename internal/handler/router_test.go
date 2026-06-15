@@ -73,17 +73,17 @@ func upstreamStub(t *testing.T) string {
 	return srv.URL
 }
 
-// recordingUpstreamStub starts an httptest server that records every incoming request path
+// recordingUpstreamServer starts an httptest server that records every incoming request path
 // and responds with the given statusCode. The last recorded path is accessible via lastPath.
-type recordingUpstreamStub struct {
+type recordingUpstreamServer struct {
 	lastPath string
 	srv      *httptest.Server
 }
 
-func newRecordingUpstreamStub(t *testing.T, statusCode int) *recordingUpstreamStub {
+func newRecordingUpstreamServer(t *testing.T, statusCode int) *recordingUpstreamServer {
 	t.Helper()
 
-	stub := &recordingUpstreamStub{}
+	stub := &recordingUpstreamServer{}
 	stub.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		stub.lastPath = r.URL.Path
 		w.WriteHeader(statusCode)
@@ -516,7 +516,7 @@ func TestWaitlistRoute(t *testing.T) {
 	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
 	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
 
-	stub := newRecordingUpstreamStub(t, http.StatusOK)
+	stub := newRecordingUpstreamServer(t, http.StatusOK)
 
 	table := config.RouteTable{
 		"user":         config.UpstreamEntry{BaseURL: upstreamStub(t)},
@@ -649,4 +649,215 @@ func TestBodyLimit_LogoutRoute413(t *testing.T) {
 		"oversized logout body must return 413 REQUEST_ENTITY_TOO_LARGE")
 	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
 		"413 body must contain machine-readable error code")
+}
+
+func TestBodyLimit_WaitlistRoute413(t *testing.T) {
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+	verifier := jwt.NewVerifier(resolver, jwt.Issuer, jwt.Audience, 60)
+
+	stub := newRecordingUpstreamServer(t, http.StatusOK)
+
+	table := config.RouteTable{
+		"notification": config.UpstreamEntry{BaseURL: stub.srv.URL},
+	}
+
+	r, err := handler.NewRouter(&handler.RouterConfig{
+		Verifier:            verifier,
+		JWKSCache:           nil,
+		RouteTable:          table,
+		ProxyTimeout:        5,
+		RateLimitPerMin:     100_000,
+		AuthRateLimitPerMin: 100_000,
+		UserRateLimitPerMin: 100_000,
+		UserRateLimitBurst:  100_000,
+		HMACSecret:          nil,
+	})
+	require.NoError(t, err)
+
+	// 8 KiB + 1 byte exceeds the waitlist body limit (8 KiB).
+	oversized := bytes.Repeat([]byte("a"), 8*1024+1)
+
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/v1/waitlist",
+		bytes.NewReader(oversized),
+	)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code,
+		"oversized waitlist body must return 413 REQUEST_ENTITY_TOO_LARGE")
+	assert.Contains(t, w.Body.String(), "REQUEST_ENTITY_TOO_LARGE",
+		"413 body must contain machine-readable error code")
+	assert.Empty(t, stub.lastPath,
+		"oversized body must be rejected at the gateway, never forwarded to notification")
+}
+
+func recordingUpstreamStub(t *testing.T, gotPath *string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// newTestRouterWithIPRL builds a RouterConfig with explicit ipRLPerMin control.
+// Use this when the test needs ipRL to refill at a specific rate (differential-refill tests).
+
+// ─── TestOAuthRoutesArePublic ─────────────────────────────────────────────────
+
+// newTestRouterRecording builds a router whose "user" upstream is the recording
+// stub, with generous rate limits so routing (not throttling) is under test.
+func newTestRouterRecording(t *testing.T, gotPath *string) http.Handler {
+	t.Helper()
+
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"oauth-test-kid": pub}}
+	upstream := recordingUpstreamStub(t, gotPath)
+
+	// High limits so nothing is rate-limited within a handful of requests.
+	return newTestRouterWithIPRL(t, 6000, 6000, 100, 6000, resolver, upstream)
+}
+
+// TestOAuthRoutesArePublic proves the OAuth start/callback routes:
+//   - are reachable WITHOUT an Authorization header (they ARE the auth flow),
+//   - forward the exact /v1/auth/oauth/... path to the user upstream verbatim,
+//   - accept both provider slugs via the :provider path param.
+//
+// A 401 would mean the route was accidentally placed behind Auth middleware;
+// the recorded upstream path proves the gateway preserves the path for the
+// provider-validation logic that lives in the user service.
+func TestOAuthRoutesArePublic(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		method       string
+		path         string
+		wantUpstream string // exact path the user upstream must receive
+	}{
+		{
+			name:         "google start forwards verbatim, no auth",
+			method:       http.MethodGet,
+			path:         "/v1/auth/oauth/google/start",
+			wantUpstream: "/v1/auth/oauth/google/start",
+		},
+		{
+			name:         "line start forwards verbatim, no auth",
+			method:       http.MethodGet,
+			path:         "/v1/auth/oauth/line/start",
+			wantUpstream: "/v1/auth/oauth/line/start",
+		},
+		{
+			name:         "google callback forwards verbatim, no auth",
+			method:       http.MethodGet,
+			path:         "/v1/auth/oauth/google/callback?code=abc&state=xyz",
+			wantUpstream: "/v1/auth/oauth/google/callback",
+		},
+		{
+			name:         "line callback forwards verbatim, no auth",
+			method:       http.MethodGet,
+			path:         "/v1/auth/oauth/line/callback?error=access_denied&state=xyz",
+			wantUpstream: "/v1/auth/oauth/line/callback",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotPath string
+			r := newTestRouterRecording(t, &gotPath)
+
+			// No bearer token: these routes MUST NOT require auth.
+			code := doRouterRequest(t, r, tc.method, tc.path, "")
+
+			require.NotEqual(t, http.StatusUnauthorized, code,
+				"OAuth route must be public (got 401 — route is wrongly behind Auth middleware)")
+			require.NotEqual(t, http.StatusNotFound, code,
+				"OAuth route must be registered (got 404 — route not wired)")
+			assert.Equal(t, http.StatusOK, code, "expected the user upstream stub to be reached (200)")
+			assert.Equal(t, tc.wantUpstream, gotPath,
+				"gateway must forward the OAuth path to the user upstream verbatim")
+		})
+	}
+}
+
+// TestOAuthRouteMethodMismatch proves the OAuth routes are GET-only. A POST to
+// the start path must NOT reach the upstream as an OAuth start (gin returns 404
+// for an unregistered method+path combination, since no POST handler exists there).
+func TestOAuthRouteMethodMismatch(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	r := newTestRouterRecording(t, &gotPath)
+
+	// POST is not registered for the OAuth start route → gin 404 (no fallthrough to upstream).
+	code := doRouterRequest(t, r, http.MethodPost, "/v1/auth/oauth/google/start", "")
+	assert.Equal(t, http.StatusNotFound, code,
+		"OAuth start is GET-only; POST must not be routed to the upstream")
+	assert.Empty(t, gotPath, "upstream must NOT be reached for a non-GET OAuth start request")
+}
+
+// TestIdentitiesProxyRequiresAuth proves the Settings identities endpoints ride
+// the existing protected /api/:svc proxy and therefore REQUIRE a valid access
+// token. Without a bearer token the gateway must reject with 401 before any
+// upstream involvement — confirming the contract's "no gateway change needed,
+// the generic protected proxy already covers /api/user/v1/me/identities".
+func TestIdentitiesProxyRequiresAuth(t *testing.T) {
+	t.Parallel()
+
+	identitiesPaths := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"list identities", http.MethodGet, "/api/user/v1/me/identities"},
+		{"link start", http.MethodPost, "/api/user/v1/me/identities/google/link"},
+		{"unlink", http.MethodDelete, "/api/user/v1/me/identities/line"},
+	}
+
+	for _, tc := range identitiesPaths {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotPath string
+			r := newTestRouterRecording(t, &gotPath)
+
+			// No bearer token: the protected proxy must reject with 401.
+			code := doRouterRequest(t, r, tc.method, tc.path, "")
+			assert.Equal(t, http.StatusUnauthorized, code,
+				"identities endpoints must require auth (protected /api/:svc proxy)")
+			assert.Empty(t, gotPath, "upstream must NOT be reached for an unauthenticated identities request")
+		})
+	}
+}
+
+// TestIdentitiesProxyForwardsWithAuth proves an authenticated identities request
+// is forwarded to the user upstream with the /api/user prefix stripped (verbatim
+// downstream path /v1/me/identities), via the existing protected proxy — no new
+// gateway route was added for identities.
+func TestIdentitiesProxyForwardsWithAuth(t *testing.T) {
+	t.Parallel()
+
+	pub, priv := generateEdDSAKey(t)
+	const kid = "identities-test-kid"
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{kid: pub}}
+
+	var gotPath string
+	upstream := recordingUpstreamStub(t, &gotPath)
+	r := newTestRouterWithIPRL(t, 6000, 6000, 100, 6000, resolver, upstream)
+
+	token := mintToken(t, priv, kid, fmt.Sprintf("user-identities-%d", time.Now().UnixNano()))
+	code := doRouterRequest(t, r, http.MethodGet, "/api/user/v1/me/identities", token)
+
+	require.Equal(t, http.StatusOK, code, "authenticated identities request must reach the upstream")
+	assert.Equal(t, "/v1/me/identities", gotPath,
+		"gateway must strip /api/user and forward /v1/me/identities to the user upstream")
 }

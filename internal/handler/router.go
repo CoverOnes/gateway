@@ -137,7 +137,11 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	// NoCache prevents CDN/proxy from caching the write response.
 	// bodyLimitWaitlist (8 KiB) guards against body-buffering DoS on this
 	// unauthenticated write endpoint before the upstream is reached.
-	// The notification service enforces an additional per-IP 5/min limiter internally.
+	// The gateway ipRL above is the effective per-IP gate for this route. The notification
+	// service also applies a 5/min limiter, but it currently keys on the gateway egress IP
+	// (notification SetTrustedProxies(nil)), so it degrades to a per-gateway global gate —
+	// real per-client limiting there is pending notification trusted-proxy config (tracked
+	// separately, see the ClientIP trust-chain task).
 	r.POST(
 		"/v1/waitlist",
 		middleware.NoCache(),
