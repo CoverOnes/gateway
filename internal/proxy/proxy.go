@@ -32,6 +32,14 @@ type plainResponseWriter struct {
 // the same cleaned path — fixing the CONVENTIONS §10 path-confusion finding.
 type ctxKeyNormalizedPath struct{}
 
+// ctxKeyClientIP is the context key used to pass the gateway-resolved client IP
+// from Forward (where the *gin.Context — and thus c.ClientIP() — is available)
+// to the Rewrite hook (which only sees the raw *http.Request). The resolved IP
+// is then forwarded to the upstream via X-Forwarded-For so downstream services
+// can key per-IP rate limiting on the real client rather than the gateway's
+// internal egress IP. Mirrors the ctxKeyNormalizedPath stash-then-read pattern.
+type ctxKeyClientIP struct{}
+
 // sentinelNoForward is the host value set on req.Out.URL when the Rewrite
 // closure detects a missing/empty normalized-path context key (S3 guard).
 // Setting Host to "" causes the transport to fail the dial immediately, so
@@ -145,6 +153,30 @@ func New(table config.RouteTable, proxyTimeoutSec int) (*Registry, error) {
 				req.Out.URL.RawQuery = req.In.URL.RawQuery
 				// Propagate X-Request-ID downstream.
 				req.Out.Header.Set("X-Request-ID", req.In.Header.Get("X-Request-ID"))
+
+				// Forward the REAL client IP to the upstream via X-Forwarded-For so
+				// downstream services can key per-IP rate limiting on the actual client
+				// instead of the gateway's internal egress IP.
+				//
+				// Defining a Rewrite hook disables stdlib ReverseProxy's automatic
+				// X-Forwarded-For appending, so we must set it explicitly here.
+				//
+				// ANTI-SPOOF: the trust source is the gateway's own c.ClientIP()
+				// (governed by GATEWAY_TRUSTED_PROXY_CIDR, validated to reject
+				// 0.0.0.0/0), stashed on the request context by Forward — NOT any
+				// client-supplied header. We DELETE any inbound X-Forwarded-For and
+				// X-Real-IP first, then SET a single XFF hop with the resolved IP.
+				// This overwrite (not append) is the defense: the gateway's inbound
+				// identity-strip (internal/platform/middleware/identity.go) does NOT
+				// strip these two headers, so a client could otherwise pre-seed a
+				// fake hop. Overwriting here guarantees the upstream sees exactly one
+				// XFF value — the IP the gateway resolved — and never a spoofed chain.
+				req.Out.Header.Del("X-Forwarded-For")
+				req.Out.Header.Del("X-Real-IP")
+
+				if clientIP, ok := req.In.Context().Value(ctxKeyClientIP{}).(string); ok && clientIP != "" {
+					req.Out.Header.Set("X-Forwarded-For", clientIP)
+				}
 			},
 			Transport:     transport,
 			FlushInterval: -1, // streaming support
@@ -355,9 +387,17 @@ func (r *Registry) Forward(c *gin.Context, svc string) {
 	// Stash the normalized path in the request context so Rewrite picks it up.
 	// This closes the guard-vs-forwarder split: Rewrite uses the cleaned path
 	// the guard just validated rather than re-stripping the raw (un-cleaned) path.
-	c.Request = c.Request.WithContext(
-		context.WithValue(c.Request.Context(), ctxKeyNormalizedPath{}, normalized),
-	)
+	ctx := context.WithValue(c.Request.Context(), ctxKeyNormalizedPath{}, normalized)
+
+	// Stash the gateway-resolved client IP so Rewrite can forward it via
+	// X-Forwarded-For. c.ClientIP() is only available here (the Rewrite hook
+	// sees the raw *http.Request, not the *gin.Context). Its value honors the
+	// configured GATEWAY_TRUSTED_PROXY_CIDR trust boundary, so it is the real
+	// client IP in production and the direct connection IP when proxy trust is
+	// disabled — in both cases the value the gateway actually trusts.
+	ctx = context.WithValue(ctx, ctxKeyClientIP{}, c.ClientIP())
+
+	c.Request = c.Request.WithContext(ctx)
 
 	// Wrap c.Writer in plainResponseWriter to prevent httputil.ReverseProxy from
 	// type-asserting to http.CloseNotifier (gin's responseWriter panics when the
