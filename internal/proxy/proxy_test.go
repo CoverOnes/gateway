@@ -203,6 +203,99 @@ func TestProxy_InboundSpoofedIdentityHeaderIsStripped(t *testing.T) {
 	assert.NotEqual(t, "spoofed-user-id", capturer.receivedHeaders.Get("X-User-Id"))
 }
 
+// TestProxy_ForwardsResolvedClientIPViaXFF proves the gateway forwards its own
+// resolved client IP to the upstream via X-Forwarded-For, and that any
+// client-supplied inbound X-Forwarded-For / X-Real-IP is OVERWRITTEN (anti-spoof),
+// never appended or trusted.
+//
+// The test router uses SetTrustedProxies(nil) (no TrustedProxyCIDRs in
+// RouterConfig), so c.ClientIP() resolves to the direct connection IP —
+// httptest.NewRequest's default RemoteAddr "192.0.2.1:1234" → "192.0.2.1".
+// That is the gateway-trusted value, independent of any inbound XFF header.
+func TestProxy_ForwardsResolvedClientIPViaXFF(t *testing.T) {
+	// The expected resolved client IP for all cases: httptest sets RemoteAddr to
+	// "192.0.2.1:1234" and proxy trust is disabled, so c.ClientIP() == "192.0.2.1".
+	const expectedClientIP = "192.0.2.1"
+
+	tests := []struct {
+		name          string
+		inboundXFF    string // client-supplied X-Forwarded-For (empty = not set)
+		inboundRealIP string // client-supplied X-Real-IP (empty = not set)
+	}{
+		{
+			name: "no inbound forwarding headers — XFF set to resolved IP",
+		},
+		{
+			name:       "spoofed inbound X-Forwarded-For is overwritten",
+			inboundXFF: "1.2.3.4",
+		},
+		{
+			name:       "spoofed multi-hop X-Forwarded-For chain is overwritten not appended",
+			inboundXFF: "1.2.3.4, 5.6.7.8, 9.10.11.12",
+		},
+		{
+			name:          "spoofed X-Real-IP is dropped and XFF set to resolved IP",
+			inboundRealIP: "203.0.113.99",
+		},
+		{
+			name:          "both spoofed XFF and X-Real-IP are overwritten",
+			inboundXFF:    "198.51.100.7",
+			inboundRealIP: "203.0.113.99",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pub, priv, kid := generateEdDSAKey(t)
+
+			capturer := &upstreamCapturer{}
+			upstream := httptest.NewServer(capturer)
+			defer upstream.Close()
+
+			routerCfg := buildRouter(t, pub, kid, upstream.URL)
+			r, err := handler.NewRouter(routerCfg)
+			require.NoError(t, err)
+
+			tokenStr := signTestToken(t, priv, kid, "user-abc")
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/user/v1/me", http.NoBody)
+			req.Header.Set("Authorization", "Bearer "+tokenStr)
+
+			if tc.inboundXFF != "" {
+				req.Header.Set("X-Forwarded-For", tc.inboundXFF)
+			}
+
+			if tc.inboundRealIP != "" {
+				req.Header.Set("X-Real-IP", tc.inboundRealIP)
+			}
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code)
+
+			// (a) Upstream receives XFF == the gateway-resolved client IP, as a single hop.
+			gotXFF := capturer.receivedHeaders.Get("X-Forwarded-For")
+			assert.Equal(t, expectedClientIP, gotXFF,
+				"upstream must receive XFF = the gateway-resolved client IP (single hop)")
+
+			// (b) Any client-supplied inbound value must be OVERWRITTEN, not appended.
+			if tc.inboundXFF != "" {
+				assert.NotContains(t, gotXFF, tc.inboundXFF,
+					"spoofed inbound X-Forwarded-For must not survive to the upstream")
+				assert.NotContains(t, gotXFF, ",",
+					"XFF must be a single resolved hop, never an appended chain")
+			}
+
+			// (b') Client-supplied X-Real-IP must be dropped entirely (gateway does not vouch for it).
+			if tc.inboundRealIP != "" {
+				assert.Empty(t, capturer.receivedHeaders.Get("X-Real-IP"),
+					"client-supplied X-Real-IP must be stripped, not forwarded")
+			}
+		})
+	}
+}
+
 func TestProxy_Upstream5xxSurfacesGeneric502(t *testing.T) {
 	pub, priv, kid := generateEdDSAKey(t)
 
