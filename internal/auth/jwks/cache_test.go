@@ -79,6 +79,7 @@ func TestCache_FailSecure_KeepsLastGoodKeys(t *testing.T) {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(jwksPayload)
 		} else {
 			// Subsequent calls: simulate upstream down.
@@ -131,6 +132,7 @@ func TestCache_RefreshOnUnknownKid(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(payload)
 	}))
 	defer srv.Close()
@@ -216,6 +218,94 @@ func TestCache_CrossHostRedirectIsRejected(t *testing.T) {
 		"cache must not be ready when JWKS endpoint redirects to a cross-host destination")
 }
 
+// TestCache_ContentTypeMismatchIsRejected verifies that a JWKS endpoint returning
+// a non-JSON Content-Type (e.g. an HTML WAF error page) causes the fetch to fail
+// rather than attempting to JSON-decode an HTML body and producing a confusing error.
+func TestCache_ContentTypeMismatchIsRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html><body>WAF block page</body></html>"))
+	}))
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	assert.False(t, cache.Ready(),
+		"cache must not be ready when the JWKS endpoint returns a non-JSON Content-Type")
+}
+
+// TestCache_ContentTypeWithCharsetIsAccepted verifies that a Content-Type of
+// "application/json; charset=utf-8" (with a parameters suffix) is accepted.
+func TestCache_ContentTypeWithCharsetIsAccepted(t *testing.T) {
+	_, kid, x := generateKey(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		payload, _ := json.Marshal(authjwt.JWKS{Keys: []authjwt.JWKSKey{
+			{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid, X: x},
+		}})
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	assert.True(t, cache.Ready(),
+		"cache must be ready when Content-Type is application/json with optional params")
+}
+
+// serveNGeneratedKeys starts a test JWKS server returning n freshly generated Ed25519 keys.
+func serveNGeneratedKeys(t *testing.T, n int) *httptest.Server {
+	t.Helper()
+
+	keys := make([]authjwt.JWKSKey, n)
+	for i := range n {
+		_, kid, x := generateKey(t)
+		keys[i] = authjwt.JWKSKey{Kty: "OKP", Crv: "Ed25519", Use: "sig", Alg: "EdDSA", Kid: kid, X: x}
+	}
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		payload, err := json.Marshal(authjwt.JWKS{Keys: keys})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(payload)
+	}))
+}
+
+// TestCache_TooManyKeysIsRejected verifies that a JWKS response with more than
+// maxJWKSKeyCount keys is rejected as a defense-in-depth measure. A real JWKS
+// contains 1–3 keys during rotation; an excessively large set indicates a
+// malformed or hostile response.
+func TestCache_TooManyKeysIsRejected(t *testing.T) {
+	srv := serveNGeneratedKeys(t, 51) // one over the limit of 50
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	assert.False(t, cache.Ready(),
+		"cache must not be ready when JWKS response exceeds the key-count limit")
+}
+
+// TestCache_ExactlyAtKeyLimitIsAccepted verifies that a JWKS response with exactly
+// maxJWKSKeyCount (50) keys is accepted (boundary is inclusive from below).
+func TestCache_ExactlyAtKeyLimitIsAccepted(t *testing.T) {
+	srv := serveNGeneratedKeys(t, 50) // exactly at the limit
+	defer srv.Close()
+
+	cache := jwks.NewCache(srv.URL, 5*time.Minute, 5*time.Second)
+	cache.Start(context.Background())
+
+	assert.True(t, cache.Ready(),
+		"cache must be ready when JWKS response contains exactly the key-count limit (50)")
+}
+
 // TestCache_SameHostRedirectIsAllowed verifies that a JWKS server issuing a
 // same-host redirect (e.g. HTTP→HTTPS upgrade or path normalization) is followed.
 func TestCache_SameHostRedirectIsAllowed(t *testing.T) {
@@ -296,6 +386,7 @@ func TestCache_SingleFlightReusesLeaderFetch(t *testing.T) {
 			return
 		}
 
+		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(payload)
 	}))
 	defer srv.Close()

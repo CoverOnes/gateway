@@ -840,6 +840,53 @@ func TestIdentitiesProxyRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestOAuthExchangeGatedByAuthRL verifies that POST /v1/auth/oauth/exchange is
+// subject to the authRL rate limiter (20/min), not merely the global ipRL (60/min).
+//
+// Strategy (mirrors TestLogoutNotGatedByAuthRL in reverse):
+//  1. Build a router where authRL = 1/min (stays empty after burst) and ipRL = 6000/min
+//     (refills quickly). Both share fallback burst = 10.
+//  2. Exhaust burst by hitting /v1/auth/login (an authRL-gated endpoint).
+//  3. Sleep 200ms — ipRL refills; authRL stays ~0.
+//  4. POST /v1/auth/oauth/exchange MUST return 429 (authRL still depleted).
+//     If oauth/exchange were only behind ipRL it would succeed after the sleep.
+func TestOAuthExchangeGatedByAuthRL(t *testing.T) {
+	upstream := upstreamStub(t)
+
+	pub, _ := generateEdDSAKey(t)
+	resolver := &staticKeyResolver{keys: map[string]ed25519.PublicKey{"kid": pub}}
+
+	// authRL = 1/min → stays exhausted during the 200 ms sleep window.
+	// ipRL = 12000/min (≈200 tokens/s) → refills ≥ 40 tokens in 200 ms, safely above burst.
+	const authRLPerMin = 1
+	const ipRLPerMin = 12000
+
+	// userRLBurst=200 so user-keyed limiting never interferes (exchange is unauthenticated).
+	r := newTestRouterWithIPRL(t, authRLPerMin, 600, 200, ipRLPerMin, resolver, upstream)
+
+	// Step 1: exhaust authRL burst via the login route.
+	var got429 bool
+
+	for range 15 {
+		code := doRouterRequest(t, r, http.MethodPost, "/v1/auth/login", "")
+		if code == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+
+	require.True(t, got429, "authRL must be exhausted within 15 login attempts")
+
+	// Step 2: sleep 200ms — ipRL refills, authRL stays ~0.
+	time.Sleep(200 * time.Millisecond)
+
+	// Step 3: POST /v1/auth/oauth/exchange MUST be blocked by the (still-depleted) authRL.
+	// If it were only behind ipRL, the refilled bucket would allow it through.
+	exchangeCode := doRouterRequest(t, r, http.MethodPost, "/v1/auth/oauth/exchange", "")
+	assert.Equal(t, http.StatusTooManyRequests, exchangeCode,
+		"/v1/auth/oauth/exchange must be blocked by authRL even when ipRL has recovered")
+}
+
 // TestIdentitiesProxyForwardsWithAuth proves an authenticated identities request
 // is forwarded to the user upstream with the /api/user prefix stripped (verbatim
 // downstream path /v1/me/identities), via the existing protected proxy — no new

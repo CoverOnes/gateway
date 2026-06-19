@@ -9,13 +9,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	authjwt "github.com/CoverOnes/gateway/internal/auth/jwt"
 )
+
+// maxJWKSKeyCount is the maximum number of keys accepted in a single JWKS response.
+// A pathological-but-small response (< 1 MiB) with thousands of generated keys would
+// still waste parser CPU; 50 is well above any real-world rotation count.
+const maxJWKSKeyCount = 50
 
 // Cache holds an in-memory map of kid->ed25519.PublicKey with TTL-based refresh.
 // It is safe for concurrent use. Fetch failures keep the last-good key set (fail-secure).
@@ -193,12 +200,27 @@ func (c *Cache) fetch() error {
 		return fmt.Errorf("JWKS fetch returned status %d", resp.StatusCode)
 	}
 
+	// Verify the response Content-Type is application/json before decoding.
+	// A WAF or CDN returning an HTML error page (text/html; charset=utf-8) would
+	// otherwise be parsed as JSON and produce a confusing "decode JWKS: ..." error.
+	// Checking the Content-Type first gives a clear, actionable error message.
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		return fmt.Errorf("JWKS response has unexpected Content-Type %q (want application/json)", ct)
+	}
+
 	// Limit body to 1 MiB to prevent OOM if the upstream returns a huge response.
 	limited := io.LimitReader(resp.Body, 1<<20)
 
 	var jwksResp authjwt.JWKS
 	if err := json.NewDecoder(limited).Decode(&jwksResp); err != nil {
 		return fmt.Errorf("decode JWKS: %w", err)
+	}
+
+	// Reject pathologically large key sets. A real JWKS contains 1–3 keys during
+	// rotation; more than maxJWKSKeyCount (50) is implausible and a sign of a
+	// malformed or hostile response.
+	if len(jwksResp.Keys) > maxJWKSKeyCount {
+		return fmt.Errorf("JWKS response contains %d keys (limit %d); rejecting", len(jwksResp.Keys), maxJWKSKeyCount)
 	}
 
 	newKeys := make(map[string]ed25519.PublicKey, len(jwksResp.Keys))
@@ -232,7 +254,21 @@ func (c *Cache) fetch() error {
 }
 
 // refreshLoop periodically refreshes the JWKS cache until ctx is canceled.
+//
+// A randomized initial stagger of up to ttl/4 is applied before the first
+// ticker tick. In a multi-pod deployment all pods start at roughly the same
+// wall-clock time; without this jitter every pod would fire its first
+// background refresh simultaneously, creating a thundering-herd against the
+// JWKS endpoint. The stagger spreads that load across a ttl/4 window without
+// delaying readiness (the synchronous fetch in Start already populated the cache).
 func (c *Cache) refreshLoop(ctx context.Context) {
+	jitter := time.Duration(rand.Int64N(int64(c.ttl / 4)))
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(jitter):
+	}
+
 	ticker := time.NewTicker(c.ttl)
 	defer ticker.Stop()
 
