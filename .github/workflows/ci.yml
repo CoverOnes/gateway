@@ -22,10 +22,6 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.11.4
-          # Skip `config verify`: .golangci.yml still carries a few v1-schema keys
-          # pending a proper v2 migration (tracked separately). `golangci-lint run`
-          # itself passes; verify is a stricter schema gate not run by the old curl path.
-          verify: false
 
   vet:
     name: go vet

@@ -2,7 +2,7 @@ version: "2"
 
 run:
   timeout: 5m
-  go: "1.25"
+  go: "1.26"
   modules-download-mode: readonly
   tests: true
 
@@ -110,27 +110,27 @@ linters:
         - G704 # SSRF taint analysis — healthcheck targets 127.0.0.1 only; suppressed via nolint too
         - G115 # Integer overflow int->uint32 — suppressed via nolint on specific lines
 
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - mnd
-        - gocyclo
-        - dupl
-        - goconst
-        - lll
-        - noctx     # httptest.NewRequest without context is standard test pattern
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - mnd
+          - gocyclo
+          - dupl
+          - goconst
+          - lll
+          - noctx     # httptest.NewRequest without context is standard test pattern
 
+issues:
   max-issues-per-linter: 0
   max-same-issues: 0
   uniq-by-line: false
 
 output:
   formats:
-    colored-line-number:
+    text:
+      colors: true
       path: stdout
-  print-issued-lines: true
-  print-linter-name: true
 
 severity:
-  default-severity: error
+  default: error
