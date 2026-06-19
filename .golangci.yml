@@ -105,7 +105,7 @@ linters:
         - G305 # Zip traversal — no zip extraction in this project
         - G306 # Poor file write permissions — reviewed case-by-case
         - G307 # Poor file permissions on create — reviewed case-by-case
-        - G404 # Insecure random — crypto/rand used for all security paths
+        - G404 # Insecure random — math/rand/v2 used for non-security load distribution (jitter); crypto/rand for all auth/crypto paths
         - G601 # Implicit memory aliasing in for loop — fixed in Go 1.22+
         - G704 # SSRF taint analysis — healthcheck targets 127.0.0.1 only; suppressed via nolint too
         - G115 # Integer overflow int->uint32 — suppressed via nolint on specific lines
@@ -114,7 +114,6 @@ linters:
     rules:
       - path: _test\.go
         linters:
-          - mnd
           - gocyclo
           - dupl
           - goconst
