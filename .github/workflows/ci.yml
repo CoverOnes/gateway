@@ -18,13 +18,14 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Install golangci-lint v2
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b $(go env GOPATH)/bin v2.11.4
-
       - name: Run golangci-lint
-        run: golangci-lint run ./...
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.11.4
+          # Skip `config verify`: .golangci.yml still carries a few v1-schema keys
+          # pending a proper v2 migration (tracked separately). `golangci-lint run`
+          # itself passes; verify is a stricter schema gate not run by the old curl path.
+          verify: false
 
   vet:
     name: go vet

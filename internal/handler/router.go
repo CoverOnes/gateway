@@ -199,16 +199,14 @@ func NewRouter(cfg *RouterConfig) (*gin.Engine, error) {
 	})
 
 	// POST /v1/auth/oauth/exchange — consumes a one-time login code and returns a token pair.
-	// Intentionally outside authGroup (no authRL): the one-time code is single-use and
-	// short-lived; it is already the rate-limiting artifact. The IP-level ipRL still applies.
-	r.POST(
-		"/v1/auth/oauth/exchange",
-		middleware.NoCache(),
-		bodyLimitMiddleware(bodyLimitAuth),
-		func(c *gin.Context) {
-			registry.Forward(c, "user")
-		},
-	)
+	// Placed inside authGroup so it inherits authRL (20/min per IP), NoCache, and bodyLimit.
+	// Although the one-time code is single-use and short-lived, an attacker can still
+	// enumerate codes or trigger downstream token issuance at a high rate; the tighter
+	// authRL rate limit (vs global ipRL 60/min) is the appropriate defense for any
+	// credential-exchange endpoint.
+	authGroup.POST("/oauth/exchange", func(c *gin.Context) {
+		registry.Forward(c, "user")
+	})
 
 	// Per-user rate limiter: keyed on JWT subject (user UUID).
 	// Placed AFTER Auth (which validates the JWT and injects claims) so the key is always
